@@ -144,8 +144,8 @@ flowchart TD
 | **3.2** | **`setup.py`** | **COMPLETED** | Interactive CLI calibration wizard with global hotkey (`Space`/`F8`), sound feedback, and visual cursor replay. |
 | **3.3** | **`engine.py`** | **COMPLETED** | Extraction of the RPA execution loop from `masterbot.py` into a reusable function accepting `(complaint_id, tech_name)`. |
 | **3.4** | **`main.py`** | **COMPLETED** | Interactive startup CLI menu, auto-calibration check, pre-flight file checks, and Dual-Input mode routing. |
-| **3.5** | **`build.py` / `.spec`** | **PENDING APPROVAL** | Automated PyInstaller packaging script and frozen executable verification. |
-| **3.6** | **Documentation & Testing** | Planned | Verification test run and updated `README.md` with office user instructions. |
+| **3.5** | **`build.py` / `.spec`** | **COMPLETED** | Automated PyInstaller packaging script and frozen executable verification. |
+| **3.6** | **Documentation & Testing** | **PENDING APPROVAL** | Verification test run and updated `README.md` with office user instructions. |
 
 ---
 
@@ -155,3 +155,4 @@ Every phase step is committed and pushed with clear descriptions:
 - **Step 3.2**: `feat(setup): add interactive calibration wizard with hotkey capture and visual replay (Step 3.2)`
 - **Step 3.3**: `feat(engine): extract unified RPA execution engine with safety aborts (Step 3.3)`
 - **Step 3.4**: `feat(main): implement CLI menu router and dual-input execution (Step 3.4)`
+- **Step 3.5**: `feat(build): add PyInstaller compilation script and spec configuration (Step 3.5)`
