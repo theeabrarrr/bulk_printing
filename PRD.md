@@ -142,8 +142,8 @@ flowchart TD
 | :--- | :--- | :---: | :--- |
 | **3.1** | **`config_manager.py` & `config.json`** | **COMPLETED** | Path resolution (`sys.executable`), DPI awareness hook, JSON schema, and validation logic. |
 | **3.2** | **`setup.py`** | **COMPLETED** | Interactive CLI calibration wizard with global hotkey (`Space`/`F8`), sound feedback, and visual cursor replay. |
-| **3.3** | **`engine.py`** | **PENDING APPROVAL** | Extraction of the RPA execution loop from `masterbot.py` into a reusable function accepting `(complaint_id, tech_name)`. |
-| **3.4** | **`main.py`** | Planned | Interactive startup CLI menu, auto-calibration check, pre-flight file checks, and Dual-Input mode routing. |
+| **3.3** | **`engine.py`** | **COMPLETED** | Extraction of the RPA execution loop from `masterbot.py` into a reusable function accepting `(complaint_id, tech_name)`. |
+| **3.4** | **`main.py`** | **PENDING APPROVAL** | Interactive startup CLI menu, auto-calibration check, pre-flight file checks, and Dual-Input mode routing. |
 | **3.5** | **`build.py` / `.spec`** | Planned | Automated PyInstaller packaging script and frozen executable verification. |
 | **3.6** | **Documentation & Testing** | Planned | Verification test run and updated `README.md` with office user instructions. |
 
@@ -153,3 +153,4 @@ flowchart TD
 Every phase step is committed and pushed with clear descriptions:
 - **Step 3.1**: `feat(config): implement config_manager and externalized config.json (Step 3.1)`
 - **Step 3.2**: `feat(setup): add interactive calibration wizard with hotkey capture and visual replay (Step 3.2)`
+- **Step 3.3**: `feat(engine): extract unified RPA execution engine with safety aborts (Step 3.3)`
