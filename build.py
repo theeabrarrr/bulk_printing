@@ -14,7 +14,8 @@ except ImportError as e:
 
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-EXE_NAME = "ERP_Bulk_Printer"
+PACKAGE_NAME = "ERP_Automation_Suite"
+EXE_NAME = "ERP_Automation_Suite"
 ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
 
 
@@ -30,11 +31,13 @@ def check_pyinstaller():
 def verify_frozen_path_anchoring():
     """
     Simulates frozen PyInstaller runtime state (sys.frozen = True)
-    to verify config_manager resolves paths next to the executable,
-    NOT inside a temporary _MEIxxxx extraction folder.
+    under the new --onedir directory structure:
+    dist/ERP_Automation_Suite/ERP_Automation_Suite.exe
+    Verifies that config_manager resolves paths next to the executable,
+    permanently bypassing Windows %TEMP% extraction and permission locks.
     """
-    print("\n--- Verifying Portable Path Anchoring (Simulated Frozen State) ---")
-    fake_exe_dir = os.path.join(PROJECT_DIR, "dist", f"{EXE_NAME}.exe")
+    print("\n--- Verifying Portable Path Anchoring (One-Dir Frozen State) ---")
+    fake_exe_dir = os.path.join(PROJECT_DIR, "dist", PACKAGE_NAME, f"{EXE_NAME}.exe")
     orig_frozen = getattr(sys, "frozen", False)
     orig_executable = sys.executable
 
@@ -50,7 +53,7 @@ def verify_frozen_path_anchoring():
         print(f"  Resolved Config Path: {resolved_cfg}")
 
         assert resolved_base == expected_base, f"Mismatch: {resolved_base} != {expected_base}"
-        print("  [+] Frozen path anchoring verified successfully!")
+        print("  [+] One-Dir frozen path anchoring verified successfully!")
     finally:
         if orig_frozen:
             sys.frozen = orig_frozen
@@ -61,9 +64,9 @@ def verify_frozen_path_anchoring():
 
 
 def build_executable():
-    """Runs PyInstaller to package main.py into a standalone .exe."""
+    """Runs PyInstaller to package main.py into a standalone --onedir suite."""
     print("=" * 60)
-    print(f"  BUILDING STANDALONE EXECUTABLE: {EXE_NAME}.exe")
+    print(f"  BUILDING ONEDIR SUITE: {PACKAGE_NAME} ({EXE_NAME}.exe)")
     print("=" * 60)
 
     verify_frozen_path_anchoring()
@@ -73,19 +76,20 @@ def build_executable():
         print("    Install it with: pip install pyinstaller")
         return False
 
+    dist_root = os.path.join(PROJECT_DIR, "dist")
     cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
-        "--onefile",
+        "--onedir",
         "--console",
         "--clean",
-        "--distpath", os.path.join(PROJECT_DIR, "dist"),
+        "--distpath", dist_root,
         "--workpath", os.path.join(PROJECT_DIR, "build"),
         "--specpath", PROJECT_DIR,
         "--name",
-        EXE_NAME,
-        # Exclude heavy unused libraries present in global Python to keep .exe compact and fast
+        PACKAGE_NAME,
+        # Exclude heavy unused libraries present in global Python to keep binary compact and fast
         "--exclude-module", "matplotlib",
         "--exclude-module", "scipy",
         "--exclude-module", "sklearn",
@@ -114,13 +118,13 @@ def build_executable():
         print(f"\n[!] Build failed with exit code {result.returncode}.")
         return False
 
-    dist_dir = os.path.join(PROJECT_DIR, "dist")
-    exe_path = os.path.join(dist_dir, f"{EXE_NAME}.exe")
+    suite_dir = os.path.join(dist_root, PACKAGE_NAME)
+    exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
 
     if os.path.exists(exe_path):
-        # Copy default config.json only if not already present in dist/ (preserves user calibration)
+        # Copy default config.json only if not already present in dist/ERP_Automation_Suite/ (preserves user calibration)
         src_cfg = os.path.join(PROJECT_DIR, "config.json")
-        dest_cfg = os.path.join(dist_dir, "config.json")
+        dest_cfg = os.path.join(suite_dir, "config.json")
         if os.path.exists(src_cfg):
             if not os.path.exists(dest_cfg):
                 shutil.copy2(src_cfg, dest_cfg)
@@ -128,20 +132,28 @@ def build_executable():
             else:
                 print(f"  [*] Preserved existing calibrated config: {dest_cfg}")
 
-        # Copy sample/active complaints.xlsx if not present in dist/
+        # Copy sample/active complaints.xlsx if not present in suite folder
         src_xlsx = os.path.join(PROJECT_DIR, "complaints.xlsx")
-        dest_xlsx = os.path.join(dist_dir, "complaints.xlsx")
+        dest_xlsx = os.path.join(suite_dir, "complaints.xlsx")
         if os.path.exists(src_xlsx) and not os.path.exists(dest_xlsx):
             shutil.copy2(src_xlsx, dest_xlsx)
             print(f"  [+] Input dataset deployed to: {dest_xlsx}")
 
+        # Ensure completed_complaints.txt exists
+        dest_tracker = os.path.join(suite_dir, "completed_complaints.txt")
+        if not os.path.exists(dest_tracker):
+            with open(dest_tracker, "w", encoding="utf-8") as f:
+                pass
+            print(f"  [+] Initialized tracking file: {dest_tracker}")
+
         print("\n" + "=" * 60)
         print("  BUILD SUCCESSFUL!")
+        print(f"  Distribution Suite: {suite_dir}")
         print(f"  Executable Location: {exe_path}")
         print("=" * 60)
         return True
 
-    print("\n[!] Build completed but executable was not found in dist/.")
+    print(f"\n[!] Build completed but executable was not found at {exe_path}.")
     return False
 
 

@@ -156,7 +156,7 @@ flowchart TD
 | **4.3** | **Modular Calibration Wizard** | **COMPLETED** | Calibration sub-menu for Print (5), OTP (4), or All (9) targets. |
 | **4.4** | **OTP Generation Engine Logic** | **COMPLETED** | Isolated `generate_otp()` with clipboard pasting and double-tap focus. |
 | **4.5** | **CLI Menu Expansion & Loop** | **COMPLETED** | Main menu option `[4] Generate OTP` with continuous interactive loop. |
-| **4.6** | **One-Dir Architecture Packaging** | **PENDING** | Refactor `build.py` to compile `--onedir` distribution `ERP_Automation_Suite`. |
+| **4.6** | **One-Dir Architecture Packaging** | **COMPLETED** | Refactor `build.py` to compile `--onedir` distribution `ERP_Automation_Suite`. |
 | **4.7** | **Verification & Documentation** | **PENDING** | Standalone verification and updated office instructions. |
 
 ---
@@ -169,3 +169,4 @@ Every phase step is committed and pushed with clear descriptions:
 - **Step 4.3**: `feat(wizard): implement modular sub-menu for print and OTP coordinate calibration (Step 4.3)`
 - **Step 4.4**: `feat(engine): implement automated generate_otp workflow with failsafes and micro-delays (Step 4.4)`
 - **Step 4.5**: `feat(cli): add interactive continuous OTP generation option [4] to main menu (Step 4.5)`
+- **Step 4.6**: `feat(build): migrate packaging to onedir deployment under ERP_Automation_Suite (Step 4.6)`
