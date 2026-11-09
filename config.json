@@ -1,0 +1,32 @@
+{
+  "screen_metadata": {
+    "calibrated_resolution": [1366, 768],
+    "calibration_timestamp": "2026-11-08 18:30:00"
+  },
+  "coordinates": {
+    "complaint_input": {"x": 118, "y": 160},
+    "main_print_btn": {"x": 1196, "y": 363},
+    "ha_field_checkbox": {"x": 764, "y": 419},
+    "popup_print_btn": {"x": 671, "y": 493},
+    "popup_exit_btn": {"x": 749, "y": 493}
+  },
+  "timings": {
+    "focus_delay": 0.5,
+    "record_load_seconds": 3.0,
+    "popup_wait_seconds": 2.0,
+    "checkbox_wait_seconds": 1.0,
+    "browser_pdf_load_seconds": 8.0,
+    "foxit_print_dialog_seconds": 2.5,
+    "save_dialog_seconds": 3.0,
+    "file_save_processing_seconds": 4.0,
+    "window_switch_seconds": 2.0,
+    "popup_close_seconds": 1.0
+  },
+  "settings": {
+    "excel_path": "complaints.xlsx",
+    "complaint_column": "COMPLAINT_NO",
+    "technician_column": "TECHNICIAN_NAME",
+    "output_dir": "Today_Complaints",
+    "progress_file": "completed_complaints.txt"
+  }
+}
