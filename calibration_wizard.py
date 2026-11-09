@@ -109,6 +109,88 @@ def replay_cursor_verification(coords, targets=None):
     print("\nVisual cursor replay complete!")
     print("=" * 55 + "\n")
 
+def configure_printer_menu(cfg=None):
+    """
+    Interactive workflow to detect, select, and configure the target Windows printer
+    and spooler queue thresholds.
+    """
+    import printer_manager as pm
+
+    if cfg is None:
+        cfg = config_manager.load_config() or config_manager.DEFAULT_CONFIG.copy()
+
+    printers = pm.get_installed_printers()
+    default_printer = pm.get_default_printer()
+    current_printer = cfg.get("printing", {}).get("printer_name")
+    current_max_queue = cfg.get("printing", {}).get("max_spool_queue", 3)
+
+    print("\n" + "=" * 60)
+    print("      SILENT PRINTER & SPOOLER CONFIGURATION")
+    print("=" * 60)
+    print(f"Windows Default Printer  : {default_printer or 'None detected'}")
+    print(f"Current Configured Target: {current_printer or '(Dynamic OS Default)'}")
+    print(f"Current Queue Threshold  : {current_max_queue} pending jobs")
+    print("-" * 60)
+    print("Installed Windows Printers:")
+    for idx, p_name in enumerate(printers, start=1):
+        tags = []
+        if p_name == default_printer:
+            tags.append("DEFAULT")
+        if p_name == current_printer:
+            tags.append("SELECTED")
+        tag_str = f" [{', '.join(tags)}]" if tags else ""
+        print(f"  [{idx}] {p_name}{tag_str}")
+
+    print("  [0] Dynamic OS Default (auto-detect system default)")
+    print("=" * 60)
+
+    choice = input(f"\nSelect printer [0-{len(printers)}] (or press Enter to keep current): ").strip()
+    selected_name = current_printer
+
+    if choice == "0":
+        selected_name = None
+        print(f" [✓] Set target printer to Dynamic OS Default ({default_printer}).")
+    elif choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(printers):
+            selected_name = printers[idx - 1]
+            print(f" [✓] Selected target printer: {selected_name}")
+        else:
+            print(" [!] Invalid index. Keeping existing printer setting.")
+    else:
+        print(" [i] Keeping current printer setting.")
+
+    # Queue threshold configuration
+    q_input = input(f"\nEnter max spooler queue jobs before hardware alert [default: {current_max_queue}]: ").strip()
+    if q_input.isdigit() and int(q_input) > 0:
+        max_q = int(q_input)
+    else:
+        max_q = current_max_queue
+
+    # Optional test print / connectivity verification
+    print("\n" + "-" * 60)
+    target_to_test = selected_name or default_printer
+    if target_to_test:
+        test_ans = input(f"Would you like to test spooler connectivity for '{target_to_test}'? [y/N]: ").strip().lower()
+        if test_ans in ["y", "yes"]:
+            print(f" [*] Querying Windows Spooler for '{target_to_test}'...")
+            q_status = pm.get_queue_status(target_to_test)
+            print(f"     Status: {'OK' if not q_status['has_error'] else 'ALERT'}")
+            print(f"     Active Spooler Jobs: {q_status['job_count']}")
+            if q_status['has_error']:
+                print(f"     Errors: {', '.join(q_status['error_reasons'])}")
+            else:
+                print("     [+] Printer device is connected and responsive!")
+
+    # Save to config
+    if "printing" not in cfg:
+        cfg["printing"] = {}
+    cfg["printing"]["printer_name"] = selected_name
+    cfg["printing"]["max_spool_queue"] = max_q
+    config_manager.save_config(cfg)
+    print("\n[+] Printer configuration successfully saved to config.json!")
+    return True
+
 def run_calibration_wizard():
     """
     Interactive CLI Calibration Wizard.
@@ -130,9 +212,10 @@ def run_calibration_wizard():
     print("  [1] Calibrate Bulk Print Targets (5 targets)")
     print("  [2] Calibrate OTP Generation Targets (4 targets)")
     print("  [3] Calibrate All Targets (9 targets)")
-    print("  [4] Return to Main Menu")
+    print("  [4] Configure Physical Printer & Spooler")
+    print("  [5] Return to Main Menu")
 
-    choice = input("\nEnter choice [1-4]: ").strip()
+    choice = input("\nEnter choice [1-5]: ").strip()
     if choice == "1":
         selected_targets = PRINT_TARGETS
         scope_name = "Bulk Print"
@@ -142,7 +225,10 @@ def run_calibration_wizard():
     elif choice == "3":
         selected_targets = ALL_TARGETS
         scope_name = "All Automation"
-    elif choice in ["4", "q", "exit", ""]:
+    elif choice == "4":
+        configure_printer_menu(cfg)
+        return True
+    elif choice in ["5", "q", "exit", ""]:
         print("Returning to main menu...")
         return False
     else:
