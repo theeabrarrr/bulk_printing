@@ -1,17 +1,17 @@
-# Oracle ERP Bulk PDF Printer & Sorter (v3.0)
+# Oracle ERP Automation Suite (v4.0: Bulk Printing & OTP Generation)
 
-An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, prints them to PDF via Internet Explorer / Foxit Reader, and automatically sorts each PDF into technician-specific folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`).
+An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, prints them to PDF via Internet Explorer / Foxit Reader, automatically sorts each PDF into technician-specific folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), and automates single-complaint **OTP Generation**.
 
-Version 3.0 introduces a **Standalone Portable Executable (`ERP_Bulk_Printer.exe`)**, an **Interactive Coordinate Calibration Wizard**, **Dual-Input Execution (Bulk Excel & Manual Single Complaint)**, and **Per-Monitor DPI Scaling Awareness**.
+Version 4.0 introduces **OTP Generation Automation**, a **Modular Calibration Sub-Menu**, an expanded 9-target **`config.json` Schema**, and a **One-Dir (`dist/ERP_Automation_Suite/`) Deployment** that permanently resolves Windows `%TEMP%` permission restrictions.
 
 ---
 
 ## Quick-Start Guide for Office Users (No Python Required)
 
 ### 1. Folder Contents
-Ensure the following files are in the same folder:
-- `ERP_Bulk_Printer.exe` — The main application (double-click to run).
-- `config.json` — Stores calibrated screen coordinates and timing settings (automatically created/updated by the Calibration Wizard).
+Ensure the following files are in the `ERP_Automation_Suite` folder:
+- `ERP_Automation_Suite.exe` — The main application (double-click to run).
+- `config.json` — Stores calibrated screen coordinates (5 Print + 4 OTP targets) and timing thresholds.
 - `complaints.xlsx` — Your daily Excel export containing `COMPLAINT_NO` and `TECHNICIAN_NAME` columns.
 - `completed_complaints.txt` — Automatically tracks printed complaints so interrupted runs resume seamlessly.
 - `Today_Complaints/` — Output folder where sorted technician PDFs are saved.
@@ -19,12 +19,13 @@ Ensure the following files are in the same folder:
 ### 2. Running the Bot
 1. Open your Oracle Forms ERP application and maximize the window.
 2. Make sure `complaints.xlsx` is **closed** in Microsoft Excel.
-3. Double-click **`ERP_Bulk_Printer.exe`**.
+3. Double-click **`ERP_Automation_Suite.exe`**.
 4. Choose an option from the Main Menu:
    - **`[1] Bulk Mode (Process complaints.xlsx)`**: Automatically processes all unprinted complaints from `complaints.xlsx` and sorts them into technician folders.
    - **`[2] Manual Mode (Process single complaint #)`**: Prompts for a single complaint number and technician name to print one specific job card on the spot.
-   - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard to calibrate mouse click positions for a new monitor or PC.
-   - **`[4] Exit`**: Closes the program.
+   - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard with sub-menu options to calibrate Bulk Print targets (5), OTP targets (4), or All targets (9).
+   - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint number and automates OTP generation in Oracle Forms in a continuous loop.
+   - **`[5] Exit`**: Closes the program.
 
 ---
 
@@ -33,19 +34,30 @@ Ensure the following files are in the same folder:
 If you move the bot to a computer with a different screen resolution, or if you see the **`[WARNING] SCREEN RESOLUTION DRIFT DETECTED`** banner:
 
 1. Select **`[3] Recalibrate Coordinates (Setup Wizard)`** from the main menu.
-2. For each of the 5 targets listed in the terminal:
-   - Hover your mouse cursor directly over the target button/field in the ERP window (you do **not** need to click back into the black terminal window).
+2. Select target set:
+   - `[1] Calibrate Bulk Print Targets (5)`
+   - `[2] Calibrate OTP Generation Targets (4)`
+   - `[3] Calibrate All Targets (9)`
+3. For each target listed in the terminal:
+   - Hover your mouse cursor directly over the target button/field in the ERP window (you do **not** need to click back into the terminal).
    - Press **`[SPACE]`** or **`[F8]`** on your keyboard.
    - You will hear a confirmation **beep** and see the captured `(X, Y)` coordinates.
    - Type **`Y`** (or press **`Enter`**) to accept, or **`R`** to retry.
-3. **Visual Cursor Replay**: Once all 5 targets are captured, the bot will smoothly glide your mouse across all 5 points on screen so you can visually verify accuracy.
+4. **Visual Cursor Replay**: The bot will smoothly glide your mouse across the calibrated points on screen so you can visually verify accuracy.
 
-**The 5 Calibrated Targets:**
+### Calibrated Targets:
+**Bulk Print Targets (5):**
 1. **Complaint Number Field** (where the complaint number is entered)
 2. **Main Print Button** (opens the print popup)
 3. **"FOR HA FIELD" Checkbox**
 4. **Popup Print Button** (sends the job to Internet Explorer / Foxit)
 5. **Popup Exit Button** (closes the print popup)
+
+**OTP Generation Targets (4):**
+6. **OTP Add Button** (opens the OTP module)
+7. **Complaint Search (3-Dots) Button** (opens complaint lookup)
+8. **Complaint Search Input Field** (field double-clicked and pasted into)
+9. **OTP Reason (3-Dots) Button** (double-tap focused to open reason list)
 
 ---
 
@@ -76,18 +88,18 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Building the Standalone Executable (`ERP_Bulk_Printer.exe`)
+### Building the Standalone Executable (`ERP_Automation_Suite.exe`)
 ```bash
 python build.py
 ```
-This compiles `main.py` via PyInstaller into `dist/ERP_Bulk_Printer.exe` and copies `config.json` into `dist/`.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` containing `ERP_Automation_Suite.exe`, `config.json`, and `complaints.xlsx`.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
-| `main.py` | Entry point, interactive CLI menu, Excel file-lock check, and Bulk/Manual routing. |
-| `config_manager.py` | Portable path anchoring (`sys.executable`), Windows Per-Monitor DPI awareness, and `config.json` validation. |
-| `setup.py` | Interactive CLI Calibration Wizard with global hotkey (`Space`/`F8`), audio chime, and cursor replay verification. |
-| `engine.py` | Unified RPA execution pipeline with `pyautogui.FAILSAFE`, `Esc` listener, and `completed_complaints.txt` auto-resume. |
-| `build.py` | PyInstaller packaging and frozen path anchoring verification script. |
+| `main.py` | Entry point, interactive CLI menu, Excel file-lock check, Bulk/Manual Print routing, and Interactive OTP loop. |
+| `config_manager.py` | Portable path anchoring (`sys.executable`), Windows Per-Monitor DPI awareness, and 9-target `config.json` validation. |
+| `calibration_wizard.py` | Interactive CLI Calibration Wizard with modular sub-menu, global hotkeys (`Space`/`F8`), audio chime, and cursor replay. |
+| `engine.py` | Unified RPA execution pipeline for Bulk/Manual Printing and isolated `generate_otp()` sequence with safety aborts. |
+| `build.py` | PyInstaller packaging script compiling `--onedir` deployment to `dist/ERP_Automation_Suite/`. |
 | `masterbot.py` | Original Phase 2 baseline script (preserved untouched). |

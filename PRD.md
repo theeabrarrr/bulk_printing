@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 3)
-**Document Version:** 1.2.0  
-**Status:** Completed (All Phase 3 Steps Delivered)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 4: OTP Generation & One-Dir Deployment)
+**Document Version:** 1.3.0  
+**Status:** In Progress (Phase 4 Underway)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
@@ -11,27 +11,28 @@ To maintain full system stability and traceability across development and deploy
 
 1. **Git Integration & Traceability**:
    - Every completed step and code modification strictly requires an immediate Git commit with a clear, descriptive, standardized commit message following Conventional Commits format (`feat(...)`, `fix(...)`, `docs(...)`, etc.).
-   - Every commit must be pushed to the remote repository (`origin/office-env`).
+   - Every commit must be pushed to the remote feature repository (`origin/feature/otp-generation`). Do not merge into `main` directly.
    - No untracked or undocumented changes are permitted.
 2. **No Unprompted Refactoring**:
    - Working code from previous phases (e.g., `masterbot.py`, verified delay timings, and GUI interaction sequences) must NEVER be modified, rewritten, or refactored unless explicitly instructed by the user.
 3. **Strict PRD & Step-by-Step Plan Alignment**:
-   - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Phase 3 Execution Plan.
+   - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Phase 4 Execution Plan.
 4. **Step-by-Step Approval Gate**:
    - Each phase step must be executed individually and presented for user review and approval before proceeding to the next step.
 
 ---
 
 ### 2. Executive Summary & Problem Statement
-The existing RPA bot automates extraction of complaint job cards from an Oracle Forms ERP application, generates PDFs via Internet Explorer / Foxit Reader, and organizes them into technician-specific folders based on an Excel file.
+The RPA bot automates extraction of complaint job cards from an Oracle Forms ERP application, generates PDFs via Internet Explorer / Foxit Reader, and organizes them into technician-specific folders based on an Excel file.
 
-However, all screen coordinates (`x, y`) were hardcoded in the codebase, causing automation failures when deployed across machines with different screen resolutions, aspect ratios, or Windows DPI scaling. Furthermore, office end-users lack Python environments, requiring a turnkey standalone executable (`.exe`).
+In Phase 4, we expand the automation suite to include **Automated OTP Generation** and resolve the Windows `%TEMP%` permission failure ("Run as Administrator" bug) by migrating to a **One-Dir (`--onedir`) Distribution Architecture** (`ERP_Automation_Suite/`).
 
-**Phase 3 Objectives:**
-1. **Decouple Configuration**: Externalize all screen coordinates, timing thresholds, file paths, and column mappings into `config.json`.
-2. **Interactive Calibration Wizard (`setup.py`)**: Provide a guided CLI wizard with global hotkey capture, sound cues, and visual cursor verification.
-3. **Dual-Input Mode**: Support both automated bulk processing from Excel and ad-hoc single-complaint manual extraction via a unified execution engine.
-4. **Standalone Compilation**: Package the application into a single portable `.exe` using PyInstaller with correct runtime directory anchoring and DPI scaling awareness.
+**Phase 4 Objectives:**
+1. **Schema & Configuration Modernization**: Expand `config.json` and `config_manager.py` to support 4 new OTP UI coordinates (`otp_add_btn`, `otp_complaint_search_btn`, `otp_search_input`, `otp_reason_search_btn`) and dedicated OTP timing thresholds.
+2. **Modular Calibration Wizard**: Introduce a sub-menu allowing operators to calibrate Bulk Print targets (5), OTP targets (4), or All targets (9) independently.
+3. **OTP Engine Implementation**: Implement isolated `generate_otp()` routine in `engine.py` using double-click text clearance, `pyperclip` clipboard pasting, coordinate focus double-tap, and 4x Enter confirmation.
+4. **Interactive Continuous Loop**: Add option `[4] Generate OTP` in `main.py` enabling back-to-back OTP generations with safety countdowns.
+5. **One-Dir Packaging Architecture**: Refactor `build.py` to package `dist/ERP_Automation_Suite/` containing `ERP_Automation_Suite.exe`, avoiding `%TEMP%` extraction errors permanently.
 
 ---
 
@@ -111,7 +112,11 @@ flowchart TD
     "main_print_btn": {"x": 1196, "y": 363},
     "ha_field_checkbox": {"x": 764, "y": 419},
     "popup_print_btn": {"x": 671, "y": 493},
-    "popup_exit_btn": {"x": 749, "y": 493}
+    "popup_exit_btn": {"x": 749, "y": 493},
+    "otp_add_btn": {"x": 200, "y": 200},
+    "otp_complaint_search_btn": {"x": 350, "y": 250},
+    "otp_search_input": {"x": 500, "y": 300},
+    "otp_reason_search_btn": {"x": 350, "y": 350}
   },
   "timings": {
     "focus_delay": 0.5,
@@ -123,7 +128,11 @@ flowchart TD
     "save_dialog_seconds": 3.0,
     "file_save_processing_seconds": 4.0,
     "window_switch_seconds": 2.0,
-    "popup_close_seconds": 1.0
+    "popup_close_seconds": 1.0,
+    "otp_window_open_seconds": 1.5,
+    "otp_search_modal_seconds": 1.2,
+    "otp_reason_focus_seconds": 1.0,
+    "otp_enter_delay_seconds": 0.3
   },
   "settings": {
     "excel_path": "complaints.xlsx",
@@ -141,20 +150,19 @@ flowchart TD
 
 | Step | Milestone | Status | Description |
 | :--- | :--- | :---: | :--- |
-| **3.1** | **`config_manager.py` & `config.json`** | **COMPLETED** | Path resolution (`sys.executable`), DPI awareness hook, JSON schema, and validation logic. |
-| **3.2** | **`setup.py`** | **COMPLETED** | Interactive CLI calibration wizard with global hotkey (`Space`/`F8`), sound feedback, and visual cursor replay. |
-| **3.3** | **`engine.py`** | **COMPLETED** | Extraction of the RPA execution loop from `masterbot.py` into a reusable function accepting `(complaint_id, tech_name)`. |
-| **3.4** | **`main.py`** | **COMPLETED** | Interactive startup CLI menu, auto-calibration check, pre-flight file checks, and Dual-Input mode routing. |
-| **3.5** | **`build.py` / `.spec`** | **COMPLETED** | Automated PyInstaller packaging script and frozen executable verification. |
-| **3.6** | **Documentation & Testing** | **COMPLETED** | Verification test run and updated `README.md` with office user instructions. |
+| **Phase 3** | **Architecture & Hardening** | **COMPLETED** | Decoupled config, calibration wizard, dual-input, PyInstaller packaging. |
+| **4.1** | **Branch & Workspace Baseline** | **COMPLETED** | Create `feature/otp-generation` and clean runtime files. |
+| **4.2** | **Config & Schema Modernization** | **COMPLETED** | Expand schema with 4 OTP targets and timings; update validation logic. |
+| **4.3** | **Modular Calibration Wizard** | **PENDING** | Calibration sub-menu for Print (5), OTP (4), or All (9) targets. |
+| **4.4** | **OTP Generation Engine Logic** | **PENDING** | Isolated `generate_otp()` with clipboard pasting and double-tap focus. |
+| **4.5** | **CLI Menu Expansion & Loop** | **PENDING** | Main menu option `[4] Generate OTP` with continuous interactive loop. |
+| **4.6** | **One-Dir Architecture Packaging** | **PENDING** | Refactor `build.py` to compile `--onedir` distribution `ERP_Automation_Suite`. |
+| **4.7** | **Verification & Documentation** | **PENDING** | Standalone verification and updated office instructions. |
 
 ---
 
 ### 6. Audit & Traceability
 Every phase step is committed and pushed with clear descriptions:
-- **Step 3.1**: `feat(config): implement config_manager and externalized config.json (Step 3.1)`
-- **Step 3.2**: `feat(setup): add interactive calibration wizard with hotkey capture and visual replay (Step 3.2)`
-- **Step 3.3**: `feat(engine): extract unified RPA execution engine with safety aborts (Step 3.3)`
-- **Step 3.4**: `feat(main): implement CLI menu router and dual-input execution (Step 3.4)`
-- **Step 3.5**: `feat(build): add PyInstaller compilation script and spec configuration (Step 3.5)`
-- **Step 3.6**: `docs: update user documentation for standalone executable and Phase 3 features (Step 3.6)`
+- **Phase 3 Baseline**: Committed and tested on `office-env`.
+- **Step 4.1**: `chore: initialize feature/otp-generation branch`
+- **Step 4.2**: `feat(config): add 4 OTP targets and timing thresholds to configuration schema (Step 4.2)`
