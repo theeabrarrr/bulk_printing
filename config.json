@@ -36,5 +36,11 @@
     "technician_column": "TECHNICIAN_NAME",
     "output_dir": "Today_Complaints",
     "progress_file": "completed_complaints.txt"
+  },
+  "printing": {
+    "printer_name": null,
+    "max_spool_queue": 3,
+    "enable_live_print": false,
+    "printed_tracker_file": "printed_complaints.txt"
   }
 }

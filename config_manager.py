@@ -42,6 +42,12 @@ DEFAULT_CONFIG = {
         "technician_column": "TECHNICIAN_NAME",
         "output_dir": "Today_Complaints",
         "progress_file": "completed_complaints.txt"
+    },
+    "printing": {
+        "printer_name": None,
+        "max_spool_queue": 3,
+        "enable_live_print": False,
+        "printed_tracker_file": "printed_complaints.txt"
     }
 }
 
@@ -176,6 +182,56 @@ def check_resolution_drift(config):
 
     has_drift = (current_res[0] != calibrated_res[0] or current_res[1] != calibrated_res[1])
     return has_drift, current_res, calibrated_res
+
+def get_printing_settings(config=None):
+    """
+    Returns the printing configuration dictionary, ensuring default fallbacks.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    printing_cfg = config.get("printing", {})
+    default_printing = DEFAULT_CONFIG["printing"]
+
+    merged = {}
+    for k, v in default_printing.items():
+        merged[k] = printing_cfg.get(k, v)
+
+    # Type safety checks
+    try:
+        merged["max_spool_queue"] = max(1, int(merged.get("max_spool_queue", 3)))
+    except (ValueError, TypeError):
+        merged["max_spool_queue"] = 3
+
+    merged["enable_live_print"] = bool(merged.get("enable_live_print", False))
+    return merged
+
+def get_configured_printer(config=None):
+    """
+    Resolves the target printer name.
+    1. Returns config["printing"]["printer_name"] if specified and installed.
+    2. Falls back to the Windows system default printer if not configured or disconnected.
+    Returns:
+        (printer_name: str or None, is_fallback: bool)
+    """
+    import printer_manager as pm
+
+    settings = get_printing_settings(config)
+    configured = settings.get("printer_name")
+    installed = pm.get_installed_printers()
+
+    if configured and configured in installed:
+        return configured, False
+
+    # Fallback to system default
+    default_p = pm.get_default_printer()
+    if default_p:
+        return default_p, True
+
+    if installed:
+        return installed[0], True
+
+    return None, False
 
 if __name__ == "__main__":
     set_dpi_awareness()
