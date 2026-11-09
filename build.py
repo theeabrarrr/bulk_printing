@@ -90,6 +90,12 @@ def build_executable():
         "--specpath", PROJECT_DIR,
         "--name",
         PACKAGE_NAME,
+        "--collect-all", "pypdfium2",
+        "--hidden-import", "win32print",
+        "--hidden-import", "win32ui",
+        "--hidden-import", "win32con",
+        "--hidden-import", "win32gui",
+        "--hidden-import", "PIL.ImageWin",
         # Exclude heavy unused libraries present in global Python to keep binary compact and fast
         "--exclude-module", "matplotlib",
         "--exclude-module", "scipy",
@@ -146,6 +152,13 @@ def build_executable():
             with open(dest_tracker, "w", encoding="utf-8") as f:
                 pass
             print(f"  [+] Initialized tracking file: {dest_tracker}")
+
+        # Ensure printed_complaints.txt exists
+        dest_print_tracker = os.path.join(suite_dir, "printed_complaints.txt")
+        if not os.path.exists(dest_print_tracker):
+            with open(dest_print_tracker, "w", encoding="utf-8") as f:
+                pass
+            print(f"  [+] Initialized print tracking file: {dest_print_tracker}")
 
         print("\n" + "=" * 60)
         print("  BUILD SUCCESSFUL!")
