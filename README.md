@@ -61,6 +61,23 @@ If you move the bot to a computer with a different screen resolution, or if you 
 
 ---
 
+## Generating OTPs for Complaints (Option 4)
+
+To generate an OTP for a single complaint in Oracle Forms:
+1. Select **`[4] Generate OTP (Interactive Mode)`** from the main menu.
+2. Enter the Complaint Number when prompted.
+3. A 3-second countdown will start to allow you to switch to or inspect the Oracle Forms window.
+4. The bot automatically executes:
+   - Clicks **Add** to open the OTP form.
+   - Clicks **3-Dots** next to Complaint No. to open search lookup.
+   - Double-clicks search input and pastes the complaint number via clipboard.
+   - Confirms selection and closes search modal (Enter x2).
+   - Double-taps the **3-Dots** next to OTP Reason (focus click, 1s delay, search click).
+   - Confirms OTP reason and commits (Enter x4).
+5. The bot returns to the prompt ready for the next complaint (or press `[ENTER]` / type `q` to return to main menu).
+
+---
+
 ## Emergency Stop (Kill-Switch)
 
 You can safely stop the bot at any time during execution using either method:

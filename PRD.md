@@ -154,7 +154,7 @@ flowchart TD
 | **4.1** | **Branch & Workspace Baseline** | **COMPLETED** | Create `feature/otp-generation` and clean runtime files. |
 | **4.2** | **Config & Schema Modernization** | **COMPLETED** | Expand schema with 4 OTP targets and timings; update validation logic. |
 | **4.3** | **Modular Calibration Wizard** | **COMPLETED** | Calibration sub-menu for Print (5), OTP (4), or All (9) targets. |
-| **4.4** | **OTP Generation Engine Logic** | **PENDING** | Isolated `generate_otp()` with clipboard pasting and double-tap focus. |
+| **4.4** | **OTP Generation Engine Logic** | **COMPLETED** | Isolated `generate_otp()` with clipboard pasting and double-tap focus. |
 | **4.5** | **CLI Menu Expansion & Loop** | **PENDING** | Main menu option `[4] Generate OTP` with continuous interactive loop. |
 | **4.6** | **One-Dir Architecture Packaging** | **PENDING** | Refactor `build.py` to compile `--onedir` distribution `ERP_Automation_Suite`. |
 | **4.7** | **Verification & Documentation** | **PENDING** | Standalone verification and updated office instructions. |
@@ -167,3 +167,4 @@ Every phase step is committed and pushed with clear descriptions:
 - **Step 4.1**: `chore: initialize feature/otp-generation branch`
 - **Step 4.2**: `feat(config): add 4 OTP targets and timing thresholds to configuration schema (Step 4.2)`
 - **Step 4.3**: `feat(wizard): implement modular sub-menu for print and OTP coordinate calibration (Step 4.3)`
+- **Step 4.4**: `feat(engine): implement automated generate_otp workflow with failsafes and micro-delays (Step 4.4)`

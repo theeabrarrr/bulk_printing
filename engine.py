@@ -191,6 +191,112 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         print(f"\n[!] Error during processing of complaint {num}: {e}")
         return False, str(e)
 
+def generate_otp(complaint_no, config=None):
+    """
+    Executes the automated OTP Generation workflow inside Oracle Forms:
+    1. Click 'Add' button to open the OTP module.
+    2. Click 3-dots next to Complaint No. to open search module.
+    3. Double-click search input, then paste complaint number via pyperclip.
+    4. Press Enter to search/select, then Enter again to confirm/close search module.
+    5. Click 3-dots next to OTP Reason (click once to focus window, wait 1s, click 3-dots).
+    6. Press Enter 4 times with micro-delays to confirm reason and return to primary screen.
+
+    Returns (success: bool, message: str).
+    """
+    if config is None:
+        config = config_manager.load_config()
+        if config is None:
+            config = config_manager.DEFAULT_CONFIG
+
+    coords = config.get("coordinates", config_manager.DEFAULT_CONFIG["coordinates"])
+    timings = config.get("timings", config_manager.DEFAULT_CONFIG["timings"])
+
+    num = str(complaint_no).strip()
+    if not num:
+        return False, "Complaint number cannot be empty."
+
+    # Early abort check
+    if check_abort():
+        return False, "OTP generation aborted by user (Esc pressed)."
+
+    try:
+        # Step 1: Open OTP module by clicking "Add" button
+        print(f"\n[OTP] Step 1/6: Opening OTP module (Click 'Add')...")
+        add_pt = coords.get("otp_add_btn", {"x": 200, "y": 200})
+        pyautogui.click(add_pt["x"], add_pt["y"])
+        time.sleep(timings.get("otp_window_open_seconds", 1.5))
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Step 2: Open Complaint search module by clicking 3-dots icon
+        print("[OTP] Step 2/6: Opening Complaint lookup (Click 3-dots)...")
+        search_btn = coords.get("otp_complaint_search_btn", {"x": 350, "y": 250})
+        pyautogui.click(search_btn["x"], search_btn["y"])
+        time.sleep(timings.get("otp_search_modal_seconds", 1.2))
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Step 3: Double-click search input to highlight text and paste complaint number
+        print(f"[OTP] Step 3/6: Highlighting and pasting Complaint #{num}...")
+        input_pt = coords.get("otp_search_input", {"x": 500, "y": 300})
+        pyautogui.doubleClick(input_pt["x"], input_pt["y"])
+        time.sleep(0.2)
+        pyperclip.copy(num)
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(0.3)
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Step 4: Press Enter to search/select, then Enter again to confirm/close
+        print("[OTP] Step 4/6: Selecting complaint and closing lookup (Enter x2)...")
+        enter_delay = timings.get("otp_enter_delay_seconds", 0.3)
+        pyautogui.press('enter')
+        time.sleep(enter_delay)
+        pyautogui.press('enter')
+        time.sleep(timings.get("otp_window_open_seconds", 1.5))
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Step 5: Click 3-dots next to OTP Reason (focus click, delay, then activate click)
+        print("[OTP] Step 5/6: Focusing and opening OTP Reason lookup (Double-tap)...")
+        reason_btn = coords.get("otp_reason_search_btn", {"x": 350, "y": 350})
+        # Focus click
+        pyautogui.click(reason_btn["x"], reason_btn["y"])
+        time.sleep(timings.get("otp_reason_focus_seconds", 1.0))
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Activate click
+        pyautogui.click(reason_btn["x"], reason_btn["y"])
+        time.sleep(timings.get("otp_search_modal_seconds", 1.2))
+
+        if check_abort():
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        # Step 6: Press Enter 4 times with micro-delays to confirm reason and return
+        print("[OTP] Step 6/6: Confirming OTP reason and committing (Enter x4)...")
+        for i in range(1, 5):
+            if check_abort():
+                return False, "OTP generation aborted by user (Esc pressed)."
+            pyautogui.press('enter')
+            time.sleep(enter_delay)
+
+        time.sleep(timings.get("otp_window_open_seconds", 1.5))
+        print(f"[✓] OTP successfully generated for Complaint #{num}!")
+        return True, f"OTP generated successfully for complaint #{num}"
+
+    except pyautogui.FailSafeException:
+        print("\n[!] EMERGENCY STOP: PyAutoGUI FailSafe triggered (mouse in corner)!")
+        return False, "Aborted by user (FailSafe triggered)."
+    except Exception as e:
+        print(f"\n[!] Unexpected error during OTP generation: {e}")
+        return False, f"OTP generation failed: {e}"
+
 def run_batch(records_iterable, config=None, start_delay=5):
     """
     Executes batch processing for an iterable of (complaint_no, tech_name) records.
