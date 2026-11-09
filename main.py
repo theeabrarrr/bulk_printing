@@ -237,7 +237,8 @@ def run_manual_mode(config):
 def run_otp_mode(config):
     """
     Interactive continuous loop for OTP Generation.
-    Prompts user for complaint number, displays countdown, and invokes engine.generate_otp().
+    Prompts user for complaint numbers (single or comma/space-separated),
+    displays countdown once, and sequentially invokes engine.generate_otp().
     Continues looping until user enters empty string or 'q'.
     """
     print("\n" + "=" * 55)
@@ -245,18 +246,22 @@ def run_otp_mode(config):
     print("=" * 55)
     print("Instructions:")
     print("  1. Ensure your Oracle Forms ERP window is visible and maximized.")
-    print("  2. Enter or paste the Complaint Number to generate its OTP.")
+    print("  2. Enter or paste Complaint Number(s) (comma/space-separated) to generate OTPs.")
     print("  3. Press [ESC] at any time during execution to emergency abort.")
     print("  4. Press [ENTER] without input (or type 'q') to return to Main Menu.")
     print("=" * 55)
 
     while True:
-        complaint_no = input("\n[->] Enter Complaint Number (or press [ENTER] to return): ").strip()
-        if not complaint_no or complaint_no.lower() in ["q", "quit", "exit"]:
+        raw_input = input("\n[->] Enter Complaint Number(s) (or press [ENTER] to return): ").strip()
+        if not raw_input or raw_input.lower() in ["q", "quit", "exit"]:
             print("Returning to main menu...")
             break
 
-        print("\n[*] Starting OTP Generation in 3 seconds! Switch to Oracle Forms window...")
+        complaint_list = [c.strip() for c in re.split(r'[\s,]+', raw_input) if c.strip()]
+        if not complaint_list:
+            continue
+
+        print(f"\n[*] Starting OTP Generation for {len(complaint_list)} complaint(s) in 3 seconds! Switch to Oracle Forms window...")
         countdown_aborted = False
         for i in range(3, 0, -1):
             if engine.check_abort():
@@ -269,13 +274,22 @@ def run_otp_mode(config):
         if countdown_aborted:
             continue
 
-        success, msg = engine.generate_otp(complaint_no, config=config)
-        if success:
-            print(f"\n[+] Success: {msg}")
-        else:
-            print(f"\n[!] Notice: {msg}")
-            if "aborted" in msg.lower() or "failsafe" in msg.lower():
-                print("    Execution paused due to abort signal.")
+        for idx, num in enumerate(complaint_list, 1):
+            if engine.check_abort():
+                print("\n[!] OTP Generation stopped by user (Esc pressed).")
+                break
+
+            print(f"\n[->] [{idx}/{len(complaint_list)}] Generating OTP for Complaint #{num}...")
+            success, msg = engine.generate_otp(num, config)
+            if success:
+                print(f"[+] Success: {msg}")
+            else:
+                print(f"[!] Notice: {msg}")
+                if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                    print("    Execution stopped due to abort signal.")
+                    break
+
+            time.sleep(1.0)
 
 
 def run_batch_print_mode(config):
