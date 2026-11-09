@@ -99,6 +99,11 @@ def build_executable():
         "--exclude-module", "grpc",
         "--exclude-module", "google",
         "--exclude-module", "pyarrow",
+        "--exclude-module", "numba",
+        "--exclude-module", "llvmlite",
+        "--exclude-module", "jinja2",
+        "--exclude-module", "IPython",
+        "--exclude-module", "tornado",
         ENTRY_SCRIPT,
     ]
 
