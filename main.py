@@ -15,17 +15,24 @@ import pandas as pd
 import config_manager
 import calibration_wizard
 import engine
+import printer_manager
 
 
 def ensure_runtime_files(config):
-    """Ensures output directory and progress tracking file exist."""
+    """Ensures output directory and progress/print tracking files exist."""
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
+    printing_cfg = config_manager.get_printing_settings(config)
+
     output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
     progress_file = config_manager.resolve_path(settings.get("progress_file", "completed_complaints.txt"))
+    printed_file = config_manager.resolve_path(printing_cfg.get("printed_tracker_file", "printed_complaints.txt"))
 
     os.makedirs(output_dir, exist_ok=True)
     if not os.path.exists(progress_file):
         with open(progress_file, "w", encoding="utf-8") as f:
+            pass
+    if not os.path.exists(printed_file):
+        with open(printed_file, "w", encoding="utf-8") as f:
             pass
 
 
@@ -110,7 +117,23 @@ def run_bulk_mode(config):
         else:
             print("    Please enter 'Y' for yes or 'N' for no.")
 
-    engine.run_batch(records, config=config, start_delay=5, organize_by_tech=organize_by_tech)
+    # Prompt user for Live Printing preference
+    configured_printer, is_fallback = config_manager.get_configured_printer(config)
+    fallback_hint = " [Dynamic OS Default]" if is_fallback else ""
+    printer_label = configured_printer or "None (PDF only)"
+
+    live_choice = input(f"\n[->] Enable Live Physical Printing to '{printer_label}'{fallback_hint}? (y/N) [Default: N]: ").strip().lower()
+    if live_choice in ["y", "yes"]:
+        if not configured_printer:
+            print("    [!] Warning: No physical printer detected. Live printing disabled.")
+            live_print = False
+        else:
+            live_print = True
+            print(f"    [+] Live physical printing enabled for '{configured_printer}'.")
+    else:
+        live_print = False
+
+    engine.run_batch(records, config=config, start_delay=5, organize_by_tech=organize_by_tech, live_print=live_print)
 
 
 def run_manual_mode(config):
@@ -150,6 +173,16 @@ def run_manual_mode(config):
     if not tech_name:
         tech_name = "Manual_Batch"
 
+    # Prompt user for Live Printing preference
+    configured_printer, is_fallback = config_manager.get_configured_printer(config)
+    fallback_hint = " [Dynamic OS Default]" if is_fallback else ""
+    printer_label = configured_printer or "None (PDF only)"
+
+    live_choice = input(f"  Enable Live Physical Printing to '{printer_label}'{fallback_hint}? (y/N) [Default: N]: ").strip().lower()
+    live_print = (live_choice in ["y", "yes"]) and bool(configured_printer)
+    if live_print:
+        print(f"  [+] Live physical printing enabled for '{configured_printer}'.")
+
     print(f"\n[*] Manual Batch Queued: {len(complaints)} complaint(s) for folder '{tech_name}'.")
     print("[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
     for i in range(5, 0, -1):
@@ -175,7 +208,7 @@ def run_manual_mode(config):
         print(f"\n[->] [{idx}/{len(complaints)}] Processing Complaint #: {complaint_no} (Batch: {tech_name})")
         # record_progress=False avoids state contamination with bulk execution
         success, msg = engine.process_complaint(
-            complaint_no, tech_name, config=config, record_progress=False, organize_by_tech=True
+            complaint_no, tech_name, config=config, record_progress=False, organize_by_tech=True, live_print=live_print
         )
 
         if success:
@@ -245,12 +278,144 @@ def run_otp_mode(config):
                 print("    Execution paused due to abort signal.")
 
 
+def run_batch_print_mode(config):
+    """
+    Offline Batch Printing:
+    Recursively scans Today_Complaints/ folder for existing PDFs,
+    cross-references against printed_complaints.txt, and silent-prints
+    unprinted PDFs directly to the target Windows printer using the
+    Spooler Queue Gate hardware failsafe.
+    """
+    settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
+    printing_settings = config_manager.get_printing_settings(config)
+    target_printer, is_fallback = config_manager.get_configured_printer(config)
+
+    if not target_printer:
+        print("\n[!] ERROR: No Windows printer available. Please connect a printer or configure one in the Setup Wizard.")
+        return
+
+    output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
+    tracker_file = config_manager.resolve_path(printing_settings.get("printed_tracker_file", "printed_complaints.txt"))
+    max_queue = printing_settings.get("max_spool_queue", 3)
+
+    if not os.path.exists(output_dir):
+        print(f"\n[!] Output directory '{output_dir}' does not exist. No PDFs to print.")
+        return
+
+    # Recursively gather all PDF documents
+    pdf_files = []
+    for root, _, files in os.walk(output_dir):
+        for f in files:
+            if f.lower().endswith(".pdf") and not f.startswith("._"):
+                pdf_files.append(os.path.join(root, f))
+
+    if not pdf_files:
+        print(f"\n[!] No PDF documents found in '{output_dir}'.")
+        return
+
+    # Load tracker state
+    printed_set = printer_manager.load_printed_complaints(tracker_file)
+
+    pending_jobs = []
+    already_printed_count = 0
+
+    for p_path in sorted(pdf_files):
+        base_name = os.path.splitext(os.path.basename(p_path))[0]
+        if base_name in printed_set:
+            already_printed_count += 1
+        else:
+            pending_jobs.append((base_name, p_path))
+
+    fallback_str = " (Dynamic OS Default)" if is_fallback else ""
+    print("\n" + "=" * 60)
+    print("        OFFLINE BATCH PRINTING (Today_Complaints)")
+    print("=" * 60)
+    print(f" Target Printer   : {target_printer}{fallback_str}")
+    print(f" Directory Scanned: {output_dir}")
+    print(f" Total PDFs Found : {len(pdf_files)}")
+    print(f" Already Printed  : {already_printed_count}")
+    print(f" Pending to Print : {len(pending_jobs)}")
+    print(f" Spooler Threshold: {max_queue} active jobs")
+    print("=" * 60)
+
+    if not pending_jobs:
+        print("\n[✓] All PDFs in 'Today_Complaints' have already been printed according to tracker!")
+        reprint_ans = input(" Would you like to force re-print all documents? (y/N) [Default: N]: ").strip().lower()
+        if reprint_ans in ["y", "yes"]:
+            pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
+            print(f" [*] Queuing all {len(pending_jobs)} documents for re-printing...")
+        else:
+            print(" Returning to main menu.")
+            return
+
+    confirm = input(f"\nProceed with printing {len(pending_jobs)} document(s)? (Y/n) [Default: Y]: ").strip().lower()
+    if confirm not in ["", "y", "yes"]:
+        print(" [!] Batch printing cancelled by operator.")
+        return
+
+    print("\n[*] Starting batch printing in 3 seconds! Press [ESC] at any time to abort...")
+    for i in range(3, 0, -1):
+        if engine.check_abort():
+            print("\n[!] Aborted during countdown.")
+            return
+        print(f"  Countdown: {i}...")
+        time.sleep(1.0)
+
+    stats = {
+        "total": len(pending_jobs),
+        "printed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "aborted": False
+    }
+
+    for idx, (c_num, p_path) in enumerate(pending_jobs, 1):
+        if engine.check_abort():
+            print("\n[!] Batch printing stopped by user (Esc pressed).")
+            stats["aborted"] = True
+            break
+
+        print(f"\n[->] [{idx}/{len(pending_jobs)}] Printing: {os.path.basename(p_path)} (Complaint #{c_num})")
+
+        # Hardware failsafe check: queue gate
+        try:
+            gate_ok = printer_manager.enforce_queue_gate(target_printer, max_jobs=max_queue)
+        except KeyboardInterrupt:
+            stats["aborted"] = True
+            break
+
+        if not gate_ok:
+            print(f"  [i] Skipped Complaint #{c_num} by user request.")
+            stats["skipped"] += 1
+            continue
+
+        try:
+            printer_manager.print_pdf_silent(p_path, target_printer, doc_name=f"Complaint_{c_num}.pdf")
+            printer_manager.mark_complaint_printed(tracker_file, c_num, p_path, target_printer)
+            stats["printed"] += 1
+            print(f"  [✓] Complaint #{c_num} successfully spooled to {target_printer}.")
+            time.sleep(0.5)  # Micro-throttle between spool jobs
+        except Exception as e:
+            print(f"  [!] Failed to print {os.path.basename(p_path)}: {e}")
+            stats["failed"] += 1
+
+    print("\n" + "=" * 50)
+    print("        BATCH PRINTING SUMMARY")
+    print("=" * 50)
+    print(f" Total Queued:         {stats['total']}")
+    print(f" Successfully Spooled: {stats['printed']}")
+    print(f" Skipped:              {stats['skipped']}")
+    print(f" Failed:               {stats['failed']}")
+    print(f" Interrupted:          {stats['aborted']}")
+    print("=" * 50 + "\n")
+
+
 def main():
     """Main CLI entry point and router."""
     config_manager.set_dpi_awareness()
 
     print("\n" + "=" * 60)
-    print("      ORACLE ERP AUTOMATION SUITE (v4.0)")
+    print("      ORACLE ERP AUTOMATION SUITE (v5.0)")
     print("=" * 60)
 
     config_path = config_manager.get_config_path()
@@ -303,12 +468,13 @@ def main():
         print("-" * 60)
         print("  [1] Bulk Mode (Process complaints.xlsx)")
         print("  [2] Manual Mode (Process single/batch complaint #s)")
-        print("  [3] Recalibrate Coordinates (Setup Wizard)")
+        print("  [3] Recalibrate Coordinates & Printer (Setup Wizard)")
         print("  [4] Generate OTP (Interactive Mode)")
-        print("  [5] Exit")
+        print("  [5] Batch Print Offline PDFs (Today_Complaints)")
+        print("  [6] Exit")
         print("-" * 60)
 
-        choice = input("Select an option [1-5]: ").strip()
+        choice = input("Select an option [1-6]: ").strip()
 
         if choice == "1":
             run_bulk_mode(config)
@@ -318,11 +484,13 @@ def main():
             calibration_wizard.run_calibration_wizard()
         elif choice == "4":
             run_otp_mode(config)
-        elif choice == "5" or choice.lower() in ["exit", "q", "quit"]:
+        elif choice == "5":
+            run_batch_print_mode(config)
+        elif choice == "6" or choice.lower() in ["exit", "q", "quit"]:
             print("\nExiting ERP Automation Suite. Goodbye!")
             break
         else:
-            print("\n[!] Invalid choice. Please enter 1, 2, 3, 4, or 5.")
+            print("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.")
 
 
 if __name__ == "__main__":

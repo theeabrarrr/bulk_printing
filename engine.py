@@ -49,7 +49,7 @@ def check_abort():
     """Checks if Esc is pressed for immediate abort."""
     return keyboard.is_pressed('esc')
 
-def process_complaint(complaint_no, tech_name, config=None, record_progress=True, organize_by_tech=True):
+def process_complaint(complaint_no, tech_name, config=None, record_progress=True, organize_by_tech=True, live_print=False):
     """
     Executes the battle-tested RPA printing sequence for a single complaint.
     Returns (success: bool, message: str).
@@ -190,6 +190,32 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             record_completed_complaint(progress_file, num)
 
         print(f"[+] {num} successfully saved in {tech}'s folder!")
+
+        # Physical Silent Printing if live_print is enabled
+        if live_print:
+            import printer_manager as pm
+            printing_cfg = config_manager.get_printing_settings(config)
+            target_printer, is_fallback = config_manager.get_configured_printer(config)
+            tracker_file = config_manager.resolve_path(printing_cfg.get("printed_tracker_file", "printed_complaints.txt"))
+            max_queue = printing_cfg.get("max_spool_queue", 3)
+
+            if target_printer:
+                fallback_note = " (System Default)" if is_fallback else ""
+                print(f"[*] Live Print: Checking spooler queue on '{target_printer}'{fallback_note}...")
+                gate_ok = pm.enforce_queue_gate(target_printer, max_jobs=max_queue)
+                if gate_ok:
+                    try:
+                        print(f"[*] Sending '{num}.pdf' to '{target_printer}'...")
+                        pm.print_pdf_silent(file_path, target_printer, doc_name=f"Complaint_{num}.pdf")
+                        pm.mark_complaint_printed(tracker_file, num, file_path, target_printer)
+                        print(f"[✓] Complaint #{num} successfully spooled to printer.")
+                    except Exception as print_err:
+                        print(f"[!] Warning: Silent physical printing failed for #{num}: {print_err}")
+                else:
+                    print(f"[i] Live printing skipped for complaint #{num} by operator.")
+            else:
+                print("[!] Warning: No Windows printer available for live printing.")
+
         time.sleep(1.0)
         return True, f"{num} completed successfully."
 
@@ -306,7 +332,7 @@ def generate_otp(complaint_no, config=None):
         print(f"\n[!] Unexpected error during OTP generation: {e}")
         return False, f"OTP generation failed: {e}"
 
-def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=True):
+def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=True, live_print=False):
     """
     Executes batch processing for an iterable of (complaint_no, tech_name) records.
     Returns summary statistics dict: {'total', 'completed', 'skipped', 'failed', 'aborted'}.
@@ -359,7 +385,9 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
             continue
 
         print(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
-        success, msg = process_complaint(num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech)
+        success, msg = process_complaint(
+            num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech, live_print=live_print
+        )
 
         if success:
             completed_set.add(num)
