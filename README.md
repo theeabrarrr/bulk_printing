@@ -21,8 +21,8 @@ Ensure the following files are in the `ERP_Automation_Suite` folder:
 2. Make sure `complaints.xlsx` is **closed** in Microsoft Excel.
 3. Double-click **`ERP_Automation_Suite.exe`**.
 4. Choose an option from the Main Menu:
-   - **`[1] Bulk Mode (Process complaints.xlsx)`**: Automatically processes all unprinted complaints from `complaints.xlsx` and sorts them into technician folders.
-   - **`[2] Manual Mode (Process single complaint #)`**: Prompts for a single complaint number and technician name to print one specific job card on the spot.
+   - **`[1] Bulk Mode (Process complaints.xlsx)`**: Automatically processes unprinted complaints from `complaints.xlsx`. Prompts whether to sort PDFs into per-technician folders (`Today_Complaints/<Technician_Name>/`) or a unified directory (`Today_Complaints/All_PDFs/`).
+   - **`[2] Manual Mode (Process single/batch complaint #s)`**: Prompts for one or multiple comma/space-separated complaint numbers (e.g. `2826001 2826002, 2826003`), deduplicates them, and processes them sequentially into a custom batch folder (default: `Today_Complaints/Manual_Batch/`).
    - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard with sub-menu options to calibrate Bulk Print targets (5), OTP targets (4), or All targets (9).
    - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint number and automates OTP generation in Oracle Forms in a continuous loop.
    - **`[5] Exit`**: Closes the program.

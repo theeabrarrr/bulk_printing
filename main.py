@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 
@@ -96,24 +97,61 @@ def run_bulk_mode(config):
         print("\n[!] No valid complaint records found in the Excel file.")
         return
 
-    engine.run_batch(records, config=config, start_delay=5)
+    # Prompt user for folder routing preference
+    organize_by_tech = True
+    while True:
+        choice = input("\n[->] Organize PDFs into separate Technician folders? (Y/N) [Default: Y]: ").strip().lower()
+        if choice in ["", "y", "yes"]:
+            organize_by_tech = True
+            break
+        elif choice in ["n", "no"]:
+            organize_by_tech = False
+            break
+        else:
+            print("    Please enter 'Y' for yes or 'N' for no.")
+
+    engine.run_batch(records, config=config, start_delay=5, organize_by_tech=organize_by_tech)
 
 
 def run_manual_mode(config):
-    """Prompts for a single complaint number and optional technician name, then runs engine."""
+    """
+    Prompts for one or multiple complaint numbers (comma or space-separated),
+    a batch/technician folder name, and processes each sequentially.
+    """
     print("\n" + "-" * 50)
-    print("         MANUAL SINGLE-COMPLAINT MODE")
+    print("       MANUAL COMPLAINT PRINT MODE (BATCH/SINGLE)")
     print("-" * 50)
-    complaint_no = input("  Enter Complaint Number (or press [ENTER] to cancel): ").strip()
-    if not complaint_no:
+    raw_input_str = input("  Enter Complaint Number(s) (comma/space-separated, or [ENTER] to cancel): ").strip()
+    if not raw_input_str:
         print("  [!] Manual mode cancelled.")
         return
 
-    tech_name = input("  Enter Technician Name [default: Manual_Single]: ").strip()
-    if not tech_name:
-        tech_name = "Manual_Single"
+    # Parse and split tokens by commas and whitespace
+    raw_tokens = [tok.strip() for tok in re.split(r'[\s,]+', raw_input_str) if tok.strip()]
+    if not raw_tokens:
+        print("  [!] No valid complaint numbers provided. Manual mode cancelled.")
+        return
 
-    print("\n[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
+    # Deduplicate preserving input order
+    seen = set()
+    complaints = []
+    has_duplicates = False
+    for num in raw_tokens:
+        if num in seen:
+            has_duplicates = True
+        else:
+            seen.add(num)
+            complaints.append(num)
+
+    if has_duplicates:
+        print(f"  [!] Notice: Duplicate numbers detected and removed. ({len(complaints)} unique record(s))")
+
+    tech_name = input("  Enter Batch / Technician Name [default: Manual_Batch]: ").strip()
+    if not tech_name:
+        tech_name = "Manual_Batch"
+
+    print(f"\n[*] Manual Batch Queued: {len(complaints)} complaint(s) for folder '{tech_name}'.")
+    print("[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
     for i in range(5, 0, -1):
         if engine.check_abort():
             print("\n[!] Aborted during countdown.")
@@ -121,14 +159,46 @@ def run_manual_mode(config):
         print(f"  Countdown: {i}...")
         time.sleep(1.0)
 
-    print(f"\n[->] Processing Single Complaint #: {complaint_no} (Tech: {tech_name})")
-    # record_progress=False avoids state contamination with bulk execution
-    success, msg = engine.process_complaint(complaint_no, tech_name, config=config, record_progress=False)
-    if success:
-        print(f"\n[+] Single complaint '{complaint_no}' processed successfully!")
-        print("    (Note: Bulk progress tracking was not updated to prevent skipping in bulk batches.)")
-    else:
-        print(f"\n[!] Single complaint failed or stopped: {msg}")
+    stats = {
+        "total": len(complaints),
+        "completed": 0,
+        "failed": 0,
+        "aborted": False
+    }
+
+    for idx, complaint_no in enumerate(complaints, 1):
+        if engine.check_abort():
+            print("\n[!] Manual batch processing stopped by user (Esc pressed).")
+            stats["aborted"] = True
+            break
+
+        print(f"\n[->] [{idx}/{len(complaints)}] Processing Complaint #: {complaint_no} (Batch: {tech_name})")
+        # record_progress=False avoids state contamination with bulk execution
+        success, msg = engine.process_complaint(
+            complaint_no, tech_name, config=config, record_progress=False, organize_by_tech=True
+        )
+
+        if success:
+            stats["completed"] += 1
+            print(f"  [+] Complaint #{complaint_no} processed successfully!")
+        else:
+            if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                print(f"  [!] Execution aborted: {msg}")
+                stats["aborted"] = True
+                break
+            else:
+                print(f"  [!] Complaint #{complaint_no} failed or stopped: {msg}")
+                stats["failed"] += 1
+
+    print("\n" + "=" * 50)
+    print("        MANUAL BATCH EXECUTION SUMMARY")
+    print("=" * 50)
+    print(f" Total entered:    {stats['total']}")
+    print(f" Completed now:    {stats['completed']}")
+    print(f" Failed:           {stats['failed']}")
+    print(f" Interrupted:      {stats['aborted']}")
+    print("=" * 50)
+    print(" (Note: Bulk progress tracking was not updated to prevent skipping in bulk batches.)\n")
 
 
 def run_otp_mode(config):
@@ -232,7 +302,7 @@ def main():
         print(" MAIN MENU")
         print("-" * 60)
         print("  [1] Bulk Mode (Process complaints.xlsx)")
-        print("  [2] Manual Mode (Process single complaint #)")
+        print("  [2] Manual Mode (Process single/batch complaint #s)")
         print("  [3] Recalibrate Coordinates (Setup Wizard)")
         print("  [4] Generate OTP (Interactive Mode)")
         print("  [5] Exit")

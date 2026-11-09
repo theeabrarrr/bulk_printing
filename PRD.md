@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 4: OTP Generation & One-Dir Deployment)
-**Document Version:** 1.4.0  
-**Status:** Completed (All Phase 4 Steps Delivered)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 4: OTP Generation, Routing & Batch Enhancements)
+**Document Version:** 1.5.0  
+**Status:** Completed (Print Routing & Manual Batch Processing Added)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
@@ -16,7 +16,7 @@ To maintain full system stability and traceability across development and deploy
 2. **No Unprompted Refactoring**:
    - Working code from previous phases (e.g., `masterbot.py`, verified delay timings, and GUI interaction sequences) must NEVER be modified, rewritten, or refactored unless explicitly instructed by the user.
 3. **Strict PRD & Step-by-Step Plan Alignment**:
-   - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Phase 4 Execution Plan.
+   - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Execution Plan.
 4. **Step-by-Step Approval Gate**:
    - Each phase step must be executed individually and presented for user review and approval before proceeding to the next step.
 
@@ -25,7 +25,7 @@ To maintain full system stability and traceability across development and deploy
 ### 2. Executive Summary & Problem Statement
 The RPA bot automates extraction of complaint job cards from an Oracle Forms ERP application, generates PDFs via Internet Explorer / Foxit Reader, and organizes them into technician-specific folders based on an Excel file.
 
-In Phase 4, we expand the automation suite to include **Automated OTP Generation** and resolve the Windows `%TEMP%` permission failure ("Run as Administrator" bug) by migrating to a **One-Dir (`--onedir`) Distribution Architecture** (`ERP_Automation_Suite/`).
+In Phase 4, we expand the automation suite to include **Automated OTP Generation**, resolve the Windows `%TEMP%` permission failure ("Run as Administrator" bug) by migrating to a **One-Dir (`--onedir`) Distribution Architecture** (`ERP_Automation_Suite/`), and add **UX & Routing Enhancements** for bulk and manual print workflows.
 
 **Phase 4 Objectives:**
 1. **Schema & Configuration Modernization**: Expand `config.json` and `config_manager.py` to support 4 new OTP UI coordinates (`otp_add_btn`, `otp_complaint_search_btn`, `otp_search_input`, `otp_reason_search_btn`) and dedicated OTP timing thresholds.
@@ -33,6 +33,8 @@ In Phase 4, we expand the automation suite to include **Automated OTP Generation
 3. **OTP Engine Implementation**: Implement isolated `generate_otp()` routine in `engine.py` using double-click text clearance, `pyperclip` clipboard pasting, coordinate focus double-tap, and 4x Enter confirmation.
 4. **Interactive Continuous Loop**: Add option `[4] Generate OTP` in `main.py` enabling back-to-back OTP generations with safety countdowns.
 5. **One-Dir Packaging Architecture**: Refactor `build.py` to package `dist/ERP_Automation_Suite/` containing `ERP_Automation_Suite.exe`, avoiding `%TEMP%` extraction errors permanently.
+6. **Bulk Mode Technician Routing**: Provide an interactive prompt in `run_bulk_mode()` to select whether PDFs are sorted into per-technician folders (`Today_Complaints/<Tech_Name>/`) or a unified directory (`Today_Complaints/All_PDFs/`).
+7. **Manual Mode Batch Processing**: Allow entering multiple comma- or space-separated complaint numbers in `run_manual_mode()`, deduplicating entries while preserving order, and processing them sequentially into a dedicated batch folder.
 
 ---
 
@@ -158,6 +160,7 @@ flowchart TD
 | **4.5** | **CLI Menu Expansion & Loop** | **COMPLETED** | Main menu option `[4] Generate OTP` with continuous interactive loop. |
 | **4.6** | **One-Dir Architecture Packaging** | **COMPLETED** | Refactor `build.py` to compile `--onedir` distribution `ERP_Automation_Suite`. |
 | **4.7** | **Verification & Documentation** | **COMPLETED** | Standalone verification and updated office instructions. |
+| **4.8** | **Print Routing & Manual Batch Processing** | **COMPLETED** | Technician folder toggle (All_PDFs) in Bulk Mode; comma/space-separated batch entry in Manual Mode. |
 
 ---
 
@@ -171,3 +174,4 @@ Every phase step is committed and pushed with clear descriptions:
 - **Step 4.5**: `feat(cli): add interactive continuous OTP generation option [4] to main menu (Step 4.5)`
 - **Step 4.6**: `feat(build): migrate packaging to onedir deployment under ERP_Automation_Suite (Step 4.6)`
 - **Step 4.7**: `chore(release): compile and verify onedir distribution package for ERP_Automation_Suite (Step 4.7)`
+- **Step 4.8**: `feat(core): add tech folder routing and manual batch processing`

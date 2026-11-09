@@ -49,7 +49,7 @@ def check_abort():
     """Checks if Esc is pressed for immediate abort."""
     return keyboard.is_pressed('esc')
 
-def process_complaint(complaint_no, tech_name, config=None, record_progress=True):
+def process_complaint(complaint_no, tech_name, config=None, record_progress=True, organize_by_tech=True):
     """
     Executes the battle-tested RPA printing sequence for a single complaint.
     Returns (success: bool, message: str).
@@ -66,14 +66,14 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
     num = str(complaint_no).strip()
     tech = sanitize_technician_name(tech_name)
 
-    # Prepare technician destination folder with explicit error handling
+    # Prepare destination folder with explicit error handling
     output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-    tech_folder = os.path.join(output_base, tech)
+    dest_folder = os.path.join(output_base, tech) if organize_by_tech else os.path.join(output_base, "All_PDFs")
     try:
-        os.makedirs(tech_folder, exist_ok=True)
+        os.makedirs(dest_folder, exist_ok=True)
     except OSError as e:
-        print(f"\n[!] Failed to create technician folder '{tech_folder}': {e}")
-        return False, f"Technician folder creation failed: {e}"
+        print(f"\n[!] Failed to create destination folder '{dest_folder}': {e}")
+        return False, f"Destination folder creation failed: {e}"
 
     progress_file = config_manager.resolve_path(settings.get("progress_file", "completed_complaints.txt"))
 
@@ -142,7 +142,7 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             return False, "Process aborted by user (Esc pressed)."
 
         # Unicode-safe path insertion via pyperclip clipboard injection
-        file_path = os.path.abspath(os.path.join(tech_folder, f"{num}.pdf"))
+        file_path = os.path.abspath(os.path.join(dest_folder, f"{num}.pdf"))
         file_existed_prior = os.path.exists(file_path)
 
         pyperclip.copy(file_path)
@@ -306,7 +306,7 @@ def generate_otp(complaint_no, config=None):
         print(f"\n[!] Unexpected error during OTP generation: {e}")
         return False, f"OTP generation failed: {e}"
 
-def run_batch(records_iterable, config=None, start_delay=5):
+def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=True):
     """
     Executes batch processing for an iterable of (complaint_no, tech_name) records.
     Returns summary statistics dict: {'total', 'completed', 'skipped', 'failed', 'aborted'}.
@@ -330,7 +330,9 @@ def run_batch(records_iterable, config=None, start_delay=5):
         "aborted": False
     }
 
+    routing_label = "Per-Technician Folders" if organize_by_tech else "All_PDFs (Unified Folder)"
     print(f"\n[*] Batch Execution Initialized: {len(records)} total records.")
+    print(f"[*] Folder Routing: {routing_label}")
     print(f"Auto-resume: {len(completed_set)} already completed records found.")
     print(f"Starting in {start_delay} seconds! Please ensure your ERP window is open and maximized...")
     
@@ -357,7 +359,7 @@ def run_batch(records_iterable, config=None, start_delay=5):
             continue
 
         print(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
-        success, msg = process_complaint(num, tech, config=config, record_progress=True)
+        success, msg = process_complaint(num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech)
 
         if success:
             completed_set.add(num)

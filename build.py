@@ -81,6 +81,7 @@ def build_executable():
         sys.executable,
         "-m",
         "PyInstaller",
+        "--noconfirm",
         "--onedir",
         "--console",
         "--clean",
