@@ -13,8 +13,9 @@ except ImportError as e:
     raise
 
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXE_NAME = "ERP_Bulk_Printer"
-ENTRY_SCRIPT = "main.py"
+ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
 
 
 def check_pyinstaller():
@@ -33,7 +34,7 @@ def verify_frozen_path_anchoring():
     NOT inside a temporary _MEIxxxx extraction folder.
     """
     print("\n--- Verifying Portable Path Anchoring (Simulated Frozen State) ---")
-    fake_exe_dir = os.path.abspath(os.path.join("dist", f"{EXE_NAME}.exe"))
+    fake_exe_dir = os.path.join(PROJECT_DIR, "dist", f"{EXE_NAME}.exe")
     orig_frozen = getattr(sys, "frozen", False)
     orig_executable = sys.executable
 
@@ -105,18 +106,30 @@ def build_executable():
         print(f"\n[!] Build failed with exit code {result.returncode}.")
         return False
 
-    dist_dir = os.path.abspath("dist")
+    dist_dir = os.path.join(PROJECT_DIR, "dist")
     exe_path = os.path.join(dist_dir, f"{EXE_NAME}.exe")
 
     if os.path.exists(exe_path):
-        # Copy default config.json alongside the compiled .exe in dist/ for immediate portability
-        src_cfg = os.path.abspath("config.json")
+        # Copy default config.json only if not already present in dist/ (preserves user calibration)
+        src_cfg = os.path.join(PROJECT_DIR, "config.json")
+        dest_cfg = os.path.join(dist_dir, "config.json")
         if os.path.exists(src_cfg):
-            shutil.copy2(src_cfg, os.path.join(dist_dir, "config.json"))
+            if not os.path.exists(dest_cfg):
+                shutil.copy2(src_cfg, dest_cfg)
+                print(f"  [+] Config initialized: {dest_cfg}")
+            else:
+                print(f"  [*] Preserved existing calibrated config: {dest_cfg}")
+
+        # Copy sample/active complaints.xlsx if not present in dist/
+        src_xlsx = os.path.join(PROJECT_DIR, "complaints.xlsx")
+        dest_xlsx = os.path.join(dist_dir, "complaints.xlsx")
+        if os.path.exists(src_xlsx) and not os.path.exists(dest_xlsx):
+            shutil.copy2(src_xlsx, dest_xlsx)
+            print(f"  [+] Input dataset deployed to: {dest_xlsx}")
+
         print("\n" + "=" * 60)
         print("  BUILD SUCCESSFUL!")
         print(f"  Executable Location: {exe_path}")
-        print(f"  Config Copied To:    {os.path.join(dist_dir, 'config.json')}")
         print("=" * 60)
         return True
 

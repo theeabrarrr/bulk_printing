@@ -4,6 +4,7 @@ import time
 import re
 import pyautogui
 import keyboard
+import pyperclip
 import config_manager
 
 # Ensure failsafe is active (slam mouse into any corner to emergency abort)
@@ -56,10 +57,14 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
     num = str(complaint_no).strip()
     tech = sanitize_technician_name(tech_name)
 
-    # Prepare technician destination folder
+    # Prepare technician destination folder with explicit error handling
     output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
     tech_folder = os.path.join(output_base, tech)
-    os.makedirs(tech_folder, exist_ok=True)
+    try:
+        os.makedirs(tech_folder, exist_ok=True)
+    except OSError as e:
+        print(f"\n[!] Failed to create technician folder '{tech_folder}': {e}")
+        return False, f"Technician folder creation failed: {e}"
 
     progress_file = config_manager.resolve_path(settings.get("progress_file", "completed_complaints.txt"))
 
@@ -117,16 +122,43 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         pyautogui.hotkey('ctrl', 'p')
         time.sleep(timings.get("foxit_print_dialog_seconds", 2.5))
 
+        if check_abort():
+            return False, "Process aborted by user (Esc pressed)."
+
         # Clicks 'OK' on the Foxit Print menu
         pyautogui.press('enter')
         time.sleep(timings.get("save_dialog_seconds", 3.0))
 
-        # Type absolute path and save in technician's folder
-        file_path = os.path.join(tech_folder, f"{num}.pdf")
-        pyautogui.write(file_path)
+        if check_abort():
+            return False, "Process aborted by user (Esc pressed)."
+
+        # Unicode-safe path insertion via pyperclip clipboard injection
+        file_path = os.path.abspath(os.path.join(tech_folder, f"{num}.pdf"))
+        file_existed_prior = os.path.exists(file_path)
+
+        pyperclip.copy(file_path)
+        time.sleep(0.3)
+        pyautogui.hotkey('ctrl', 'v')
         time.sleep(1.0)
-        pyautogui.press('enter') # Save
-        time.sleep(timings.get("file_save_processing_seconds", 4.0))
+        pyautogui.press('enter')  # Save trigger
+
+        # Dynamic modal handling: If file already existed, Windows Save As displays
+        # 'Confirm Save As: ... already exists. Do you want to replace it? [Yes] [No]'
+        # Pause briefly and confirm overwrite if the file existed prior
+        time.sleep(1.2)
+        if file_existed_prior:
+            pyautogui.press('y')
+            time.sleep(0.3)
+            pyautogui.press('enter')
+
+        # Sleep in intervals for file saving to allow responsive Esc abort
+        save_wait = timings.get("file_save_processing_seconds", 4.0)
+        elapsed = 0.0
+        while elapsed < save_wait:
+            if check_abort():
+                return False, "Process aborted by user (Esc pressed)."
+            time.sleep(0.5)
+            elapsed += 0.5
 
         # Step G: Cleanup & Record
         print("🔄 Switching back to ERP window using Alt+Tab...")
@@ -138,6 +170,11 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         popup_exit = coords.get("popup_exit_btn", {"x": 749, "y": 493})
         pyautogui.click(x=popup_exit["x"], y=popup_exit["y"])
         time.sleep(timings.get("popup_close_seconds", 1.0))
+
+        # Mandate physical verification that PDF exists and has non-zero size
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            print(f"\n[!] Verification Failed: '{file_path}' was not created or is empty.")
+            return False, f"PDF file not saved or 0 bytes: {file_path}"
 
         # Write to tracking file if requested
         if record_progress:

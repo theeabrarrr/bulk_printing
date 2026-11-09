@@ -71,8 +71,9 @@ def resolve_path(relative_or_absolute_path):
 def load_config(config_path=None):
     """
     Loads and validates config.json.
-    Falls back to default schema for any missing sections.
-    Returns None if file does not exist.
+    Returns None if the configuration file does not exist (triggering first-time setup).
+    Raises json.JSONDecodeError if the file exists but has corrupted/invalid JSON syntax,
+    preventing silent overwrites of user settings.
     """
     if config_path is None:
         config_path = get_config_path()
@@ -83,11 +84,20 @@ def load_config(config_path=None):
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print("\n" + "!" * 65)
+        print(" [CRITICAL ERROR] 'config.json' contains invalid JSON syntax!")
+        print(f" File path: {config_path}")
+        print(f" Error details: {e}")
+        print(" To prevent data loss, the bot will NOT overwrite your existing configuration.")
+        print(" Please fix the syntax in config.json or delete it to regenerate defaults.")
+        print("!" * 65 + "\n")
+        raise
     except Exception as e:
-        print(f"[Warning] Failed to read config file ({e}).")
-        return None
+        print(f"[!] Unexpected error reading configuration file ({config_path}): {e}")
+        raise
 
-    # Merge missing sections or keys with defaults
+    # Deep merge missing sections or keys with defaults
     for section, defaults in DEFAULT_CONFIG.items():
         if section not in cfg or not isinstance(cfg[section], dict):
             cfg[section] = defaults.copy()
@@ -95,6 +105,10 @@ def load_config(config_path=None):
             for k, v in defaults.items():
                 if k not in cfg[section]:
                     cfg[section][k] = v
+                elif isinstance(v, dict) and isinstance(cfg[section][k], dict):
+                    for sub_k, sub_v in v.items():
+                        if sub_k not in cfg[section][k] or cfg[section][k][sub_k] is None:
+                            cfg[section][k][sub_k] = sub_v
 
     return cfg
 

@@ -3,7 +3,7 @@ import sys
 import time
 import pandas as pd
 import config_manager
-import setup
+import calibration_wizard
 import engine
 
 
@@ -29,7 +29,7 @@ def check_excel_lock(excel_path):
             with open(excel_path, "r+b"):
                 return True
         except PermissionError:
-            print("\n[!] ERROR: 'complaints.xlsx' is currently open in Microsoft Excel or another program.")
+            print(f"\n[!] ERROR: '{excel_path}' is currently open in Microsoft Excel or another program.")
             ans = input("    Please close the Excel file and press [ENTER] to retry (or type 'q' to cancel): ").strip().lower()
             if ans == "q":
                 return False
@@ -48,7 +48,7 @@ def run_bulk_mode(config):
 
     if not os.path.exists(excel_path):
         print(f"\n[!] Error: Excel file not found at:\n    {excel_path}")
-        print("    Please place 'complaints.xlsx' in the application folder and try again.")
+        print("    Please place the Excel file at the path shown above and try again.")
         return
 
     if not check_excel_lock(excel_path):
@@ -56,10 +56,14 @@ def run_bulk_mode(config):
         return
 
     try:
-        df = pd.read_excel(excel_path)
-    except Exception as e:
-        print(f"\n[!] Failed to read Excel file: {e}")
-        return
+        # Enforce string dtype to prevent precision loss or scientific notation on complaint IDs
+        df = pd.read_excel(excel_path, dtype={complaint_col: str, tech_col: str})
+    except Exception:
+        try:
+            df = pd.read_excel(excel_path, dtype=str)
+        except Exception as e:
+            print(f"\n[!] Failed to read Excel file: {e}")
+            return
 
     if complaint_col not in df.columns:
         print(f"\n[!] Error: Required column '{complaint_col}' not found in '{excel_rel}'.")
@@ -71,9 +75,11 @@ def run_bulk_mode(config):
     records = []
     for _, row in df.iterrows():
         c_num = str(row[complaint_col]).strip()
-        # Handle float strings like '282634892.0' if pandas parsed integer column as float
+        # Handle float strings like '282634892.0' if previously converted
         if c_num.endswith(".0"):
             c_num = c_num[:-2]
+        if not c_num or c_num.lower() == "nan":
+            continue
         t_name = str(row[tech_col]).strip() if (tech_col in df.columns and pd.notna(row[tech_col])) else "Unknown"
         records.append((c_num, t_name))
 
@@ -107,9 +113,11 @@ def run_manual_mode(config):
         time.sleep(1.0)
 
     print(f"\n👉 Processing Single Complaint #: {complaint_no} (Tech: {tech_name})")
-    success, msg = engine.process_complaint(complaint_no, tech_name, config=config, record_progress=True)
+    # record_progress=False avoids state contamination with bulk execution
+    success, msg = engine.process_complaint(complaint_no, tech_name, config=config, record_progress=False)
     if success:
-        print(f"\n[+] Single complaint '{complaint_no}' processed and recorded successfully!")
+        print(f"\n[+] Single complaint '{complaint_no}' processed successfully!")
+        print("    (Note: Bulk progress tracking was not updated to prevent skipping in bulk batches.)")
     else:
         print(f"\n[!] Single complaint failed or stopped: {msg}")
 
@@ -122,12 +130,12 @@ def main():
     print("      ORACLE ERP BULK PDF PRINTER & SORTER (v3.0)")
     print("=" * 60)
 
-    config = config_manager.load_config()
-    if config is None:
+    config_path = config_manager.get_config_path()
+    if not os.path.exists(config_path):
         print("\n[!] 'config.json' not found! First-time setup is required.")
         ans = input("Would you like to launch the Calibration Wizard now? [Y/n]: ").strip().lower()
         if ans in ["", "y", "yes"]:
-            calibrated = setup.run_calibration_wizard()
+            calibrated = calibration_wizard.run_calibration_wizard()
             if not calibrated:
                 print("[!] Using default fallback coordinates.")
                 config = config_manager.DEFAULT_CONFIG.copy()
@@ -137,12 +145,25 @@ def main():
         else:
             config = config_manager.DEFAULT_CONFIG.copy()
             config_manager.save_config(config)
+    else:
+        try:
+            config = config_manager.load_config()
+        except Exception as e:
+            print(f"\n[!] Fatal: Cannot launch application because 'config.json' is corrupted: {e}")
+            print("    Please correct the syntax in 'config.json' or delete it to re-initialize.")
+            input("\nPress [ENTER] to exit...")
+            return
 
     ensure_runtime_files(config)
 
     while True:
         # Reload config on each menu cycle in case recalibration occurred
-        config = config_manager.load_config() or config_manager.DEFAULT_CONFIG
+        try:
+            loaded_cfg = config_manager.load_config()
+            if loaded_cfg:
+                config = loaded_cfg
+        except Exception as e:
+            print(f"\n[!] Warning: Failed to reload 'config.json' ({e}). Using active configuration.")
 
         # Check for screen resolution drift
         has_drift, curr_res, calib_res = config_manager.check_resolution_drift(config)
@@ -170,7 +191,7 @@ def main():
         elif choice == "2":
             run_manual_mode(config)
         elif choice == "3":
-            setup.run_calibration_wizard()
+            calibration_wizard.run_calibration_wizard()
         elif choice == "4" or choice.lower() in ["exit", "q", "quit"]:
             print("\nExiting ERP Bulk Printer. Goodbye!")
             break

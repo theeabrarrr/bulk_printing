@@ -49,7 +49,7 @@ flowchart TD
 
     subgraph CoreEngine ["Modular Codebase Structure"]
         MAIN["main.py (CLI Menu, Pre-flight Checks, Router)"]
-        SETUP["setup.py (Calibration Wizard & Cursor Replay)"]
+        SETUP["calibration_wizard.py (Setup Wizard & Verification)"]
         ENGINE["engine.py (Unified RPA Execution Loop)"]
         CFGMGR["config_manager.py (Path Anchoring, Schema, DPI Setup)"]
         BUILD["build.py (PyInstaller Packaging Script)"]
@@ -72,12 +72,13 @@ flowchart TD
   - Enforces Per-Monitor DPI awareness via `ctypes.windll.shcore.SetProcessDpiAwareness(2)` (fallback to `SetProcessDPIAware`).
   - Reads, validates, and writes `config.json`.
   - Checks if the current screen resolution matches the calibrated resolution; warns if different.
-- **`setup.py`**:
+- **`calibration_wizard.py`** *(COMPLETED - formerly `setup.py`)*:
   - Interactive CLI calibration wizard.
   - Listens globally for keypress (`Space` or `F8`) without requiring terminal focus.
   - Emits audio confirmation (`winsound.beep`), displays coordinates, and provides `[Y] Accept / [R] Retry` per step.
   - Runs **Tier 1 Verification (Visual Cursor Replay)**: glides the mouse across the 5 captured targets.
   - Runs **Tier 2 Verification (Optional Test Run)**: dispatches a single complaint test.
+  - Provided `setup.py` alias for backwards compatibility.
 - **`engine.py`**:
   - Unified RPA execution engine accepting an iterator of `(complaint_number, technician_name)`.
   - Implements the complete automation pipeline: focus ERP, double-click & input complaint, open print modal, toggle checkbox, dispatch print, trigger Foxit `Ctrl+P`, save PDF path, switch window with `Alt+Tab`, and exit modal.
