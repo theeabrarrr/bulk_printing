@@ -2,7 +2,15 @@ import os
 import sys
 import shutil
 import subprocess
-import config_manager
+
+try:
+    import config_manager
+except ImportError as e:
+    if getattr(e, "name", None) == "pyautogui":
+        print("\n[!] Missing required dependency: 'pyautogui'.")
+        print("    Please install dependencies with: pip install -r requirements.txt")
+        sys.exit(1)
+    raise
 
 
 EXE_NAME = "ERP_Bulk_Printer"
