@@ -1,6 +1,15 @@
 import os
 import sys
 import time
+
+# Ensure Unicode output doesn't crash on standard Windows consoles (cp1252)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import pandas as pd
 import config_manager
 import calibration_wizard
@@ -104,7 +113,7 @@ def run_manual_mode(config):
     if not tech_name:
         tech_name = "Manual_Single"
 
-    print("\n🚀 Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
+    print("\n[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
     for i in range(5, 0, -1):
         if engine.check_abort():
             print("\n[!] Aborted during countdown.")
@@ -112,7 +121,7 @@ def run_manual_mode(config):
         print(f"  Countdown: {i}...")
         time.sleep(1.0)
 
-    print(f"\n👉 Processing Single Complaint #: {complaint_no} (Tech: {tech_name})")
+    print(f"\n[->] Processing Single Complaint #: {complaint_no} (Tech: {tech_name})")
     # record_progress=False avoids state contamination with bulk execution
     success, msg = engine.process_complaint(complaint_no, tech_name, config=config, record_progress=False)
     if success:
@@ -122,12 +131,56 @@ def run_manual_mode(config):
         print(f"\n[!] Single complaint failed or stopped: {msg}")
 
 
+def run_otp_mode(config):
+    """
+    Interactive continuous loop for OTP Generation.
+    Prompts user for complaint number, displays countdown, and invokes engine.generate_otp().
+    Continues looping until user enters empty string or 'q'.
+    """
+    print("\n" + "=" * 55)
+    print("         INTERACTIVE OTP GENERATION MODE")
+    print("=" * 55)
+    print("Instructions:")
+    print("  1. Ensure your Oracle Forms ERP window is visible and maximized.")
+    print("  2. Enter or paste the Complaint Number to generate its OTP.")
+    print("  3. Press [ESC] at any time during execution to emergency abort.")
+    print("  4. Press [ENTER] without input (or type 'q') to return to Main Menu.")
+    print("=" * 55)
+
+    while True:
+        complaint_no = input("\n[->] Enter Complaint Number (or press [ENTER] to return): ").strip()
+        if not complaint_no or complaint_no.lower() in ["q", "quit", "exit"]:
+            print("Returning to main menu...")
+            break
+
+        print("\n[*] Starting OTP Generation in 3 seconds! Switch to Oracle Forms window...")
+        countdown_aborted = False
+        for i in range(3, 0, -1):
+            if engine.check_abort():
+                print("\n[!] Aborted during countdown.")
+                countdown_aborted = True
+                break
+            print(f"  Countdown: {i}...")
+            time.sleep(1.0)
+
+        if countdown_aborted:
+            continue
+
+        success, msg = engine.generate_otp(complaint_no, config=config)
+        if success:
+            print(f"\n[+] Success: {msg}")
+        else:
+            print(f"\n[!] Notice: {msg}")
+            if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                print("    Execution paused due to abort signal.")
+
+
 def main():
     """Main CLI entry point and router."""
     config_manager.set_dpi_awareness()
 
     print("\n" + "=" * 60)
-    print("      ORACLE ERP BULK PDF PRINTER & SORTER (v3.0)")
+    print("      ORACLE ERP AUTOMATION SUITE (v4.0)")
     print("=" * 60)
 
     config_path = config_manager.get_config_path()
@@ -181,10 +234,11 @@ def main():
         print("  [1] Bulk Mode (Process complaints.xlsx)")
         print("  [2] Manual Mode (Process single complaint #)")
         print("  [3] Recalibrate Coordinates (Setup Wizard)")
-        print("  [4] Exit")
+        print("  [4] Generate OTP (Interactive Mode)")
+        print("  [5] Exit")
         print("-" * 60)
 
-        choice = input("Select an option [1-4]: ").strip()
+        choice = input("Select an option [1-5]: ").strip()
 
         if choice == "1":
             run_bulk_mode(config)
@@ -192,11 +246,13 @@ def main():
             run_manual_mode(config)
         elif choice == "3":
             calibration_wizard.run_calibration_wizard()
-        elif choice == "4" or choice.lower() in ["exit", "q", "quit"]:
-            print("\nExiting ERP Bulk Printer. Goodbye!")
+        elif choice == "4":
+            run_otp_mode(config)
+        elif choice == "5" or choice.lower() in ["exit", "q", "quit"]:
+            print("\nExiting ERP Automation Suite. Goodbye!")
             break
         else:
-            print("\n[!] Invalid choice. Please enter 1, 2, 3, or 4.")
+            print("\n[!] Invalid choice. Please enter 1, 2, 3, 4, or 5.")
 
 
 if __name__ == "__main__":

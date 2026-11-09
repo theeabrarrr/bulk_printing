@@ -2,6 +2,15 @@ import time
 import sys
 import os
 import datetime
+
+# Ensure Unicode output doesn't crash on standard Windows consoles (cp1252)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import pyautogui
 import keyboard
 
@@ -210,7 +219,7 @@ def run_calibration_wizard():
             test_no = input("  Enter Complaint Number for test run [default: 282636629]: ").strip()
             if not test_no:
                 test_no = "282636629"
-            print(f"\n🚀 Running Tier 2 verification test with complaint #{test_no}...")
+            print(f"\n[*] Running Tier 2 verification test with complaint #{test_no}...")
             import engine
             engine.process_complaint(test_no, "Calibration_Test", config=cfg, record_progress=False)
 

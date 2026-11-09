@@ -2,6 +2,15 @@ import os
 import sys
 import time
 import re
+
+# Ensure Unicode output doesn't crash on standard Windows consoles (cp1252)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import pyautogui
 import keyboard
 import pyperclip
@@ -118,7 +127,7 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             elapsed += 0.5
 
         # Step F: Print & Save as PDF
-        print(f"🖨️ Pressing Ctrl+P for {tech}...")
+        print(f"[*] Pressing Ctrl+P for {tech}...")
         pyautogui.hotkey('ctrl', 'p')
         time.sleep(timings.get("foxit_print_dialog_seconds", 2.5))
 
@@ -161,12 +170,12 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             elapsed += 0.5
 
         # Step G: Cleanup & Record
-        print("🔄 Switching back to ERP window using Alt+Tab...")
+        print("[*] Switching back to ERP window using Alt+Tab...")
         pyautogui.hotkey('alt', 'tab')
         time.sleep(timings.get("window_switch_seconds", 2.0))
 
         # Close the Print Module popup
-        print("❌ Closing the Print Module...")
+        print("[*] Closing the Print Module...")
         popup_exit = coords.get("popup_exit_btn", {"x": 749, "y": 493})
         pyautogui.click(x=popup_exit["x"], y=popup_exit["y"])
         time.sleep(timings.get("popup_close_seconds", 1.0))
@@ -180,7 +189,7 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         if record_progress:
             record_completed_complaint(progress_file, num)
 
-        print(f"✅ {num} successfully saved in {tech}'s folder!")
+        print(f"[+] {num} successfully saved in {tech}'s folder!")
         time.sleep(1.0)
         return True, f"{num} completed successfully."
 
@@ -287,7 +296,7 @@ def generate_otp(complaint_no, config=None):
             time.sleep(enter_delay)
 
         time.sleep(timings.get("otp_window_open_seconds", 1.5))
-        print(f"[✓] OTP successfully generated for Complaint #{num}!")
+        print(f"[+] OTP successfully generated for Complaint #{num}!")
         return True, f"OTP generated successfully for complaint #{num}"
 
     except pyautogui.FailSafeException:
@@ -321,7 +330,7 @@ def run_batch(records_iterable, config=None, start_delay=5):
         "aborted": False
     }
 
-    print(f"\n🚀 Batch Execution Initialized: {len(records)} total records.")
+    print(f"\n[*] Batch Execution Initialized: {len(records)} total records.")
     print(f"Auto-resume: {len(completed_set)} already completed records found.")
     print(f"Starting in {start_delay} seconds! Please ensure your ERP window is open and maximized...")
     
@@ -343,11 +352,11 @@ def run_batch(records_iterable, config=None, start_delay=5):
             break
 
         if num in completed_set:
-            print(f"⏩ [{idx}/{len(records)}] {num} already done. Skipping...")
+            print(f"[>>] [{idx}/{len(records)}] {num} already done. Skipping...")
             stats["skipped"] += 1
             continue
 
-        print(f"\n👉 [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
+        print(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
         success, msg = process_complaint(num, tech, config=config, record_progress=True)
 
         if success:
