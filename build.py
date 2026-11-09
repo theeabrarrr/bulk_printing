@@ -80,6 +80,9 @@ def build_executable():
         "--onefile",
         "--console",
         "--clean",
+        "--distpath", os.path.join(PROJECT_DIR, "dist"),
+        "--workpath", os.path.join(PROJECT_DIR, "build"),
+        "--specpath", PROJECT_DIR,
         "--name",
         EXE_NAME,
         # Exclude heavy unused libraries present in global Python to keep .exe compact and fast
@@ -100,7 +103,7 @@ def build_executable():
     ]
 
     print(f"\nRunning command:\n  {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, cwd=PROJECT_DIR)
 
     if result.returncode != 0:
         print(f"\n[!] Build failed with exit code {result.returncode}.")

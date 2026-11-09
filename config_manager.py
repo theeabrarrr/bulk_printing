@@ -110,7 +110,40 @@ def load_config(config_path=None):
                         if sub_k not in cfg[section][k] or cfg[section][k][sub_k] is None:
                             cfg[section][k][sub_k] = sub_v
 
+    # Deep schema validation: Ensure all UI coordinate targets exist with integer x and y
+    validate_coordinates(cfg)
+
     return cfg
+
+def validate_coordinates(config):
+    """
+    Validates that all required UI targets exist in config['coordinates']
+    and each contains valid integer 'x' and 'y' values.
+    Repairs missing/invalid coordinates from DEFAULT_CONFIG and returns (is_valid: bool, config: dict).
+    """
+    if "coordinates" not in config or not isinstance(config["coordinates"], dict):
+        config["coordinates"] = {k: v.copy() for k, v in DEFAULT_CONFIG["coordinates"].items()}
+        return False, config
+
+    coords = config["coordinates"]
+    default_coords = DEFAULT_CONFIG["coordinates"]
+    repaired = False
+
+    for target, default_pt in default_coords.items():
+        if target not in coords or not isinstance(coords[target], dict):
+            coords[target] = default_pt.copy()
+            repaired = True
+        else:
+            pt = coords[target]
+            for axis in ("x", "y"):
+                val = pt.get(axis)
+                if val is None or not isinstance(val, (int, float)):
+                    pt[axis] = default_pt[axis]
+                    repaired = True
+                else:
+                    pt[axis] = int(val)
+
+    return not repaired, config
 
 def save_config(config_data, config_path=None):
     """Saves configuration data dictionary to config.json."""
