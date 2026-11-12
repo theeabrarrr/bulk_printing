@@ -47,6 +47,7 @@ OTP_TARGETS = [
 ALL_TARGETS = PRINT_TARGETS + OTP_TARGETS
 TARGETS = ALL_TARGETS
 
+
 def play_chime(freq=1000, duration_ms=200):
     """Plays an audible beep to confirm coordinate capture."""
     if winsound:
@@ -54,6 +55,7 @@ def play_chime(freq=1000, duration_ms=200):
             winsound.Beep(freq, duration_ms)
         except Exception:
             pass
+
 
 def wait_for_capture():
     """
@@ -81,6 +83,7 @@ def wait_for_capture():
 
         time.sleep(0.03)
 
+
 def replay_cursor_verification(coords, targets=None):
     """
     Tier 1 Verification:
@@ -98,6 +101,9 @@ def replay_cursor_verification(coords, targets=None):
     time.sleep(3)
 
     for key, label in targets:
+        if keyboard.is_pressed('esc'):
+            print("\n[!] Visual cursor replay aborted by user (Esc pressed).")
+            break
         pt = coords.get(key, {})
         x = pt.get("x")
         y = pt.get("y")
@@ -109,11 +115,12 @@ def replay_cursor_verification(coords, targets=None):
     print("\nVisual cursor replay complete!")
     print("=" * 55 + "\n")
 
+
 def configure_printer_menu(cfg=None):
     """
     Sub-menu [4]: Configure Physical Printer & Spooler.
     Delegates to printer_manager.select_printer_interactive and allows configuring
-    spooler queue thresholds and testing device responsiveness.
+    spooler queue thresholds and checking spooler status flags.
     """
     import printer_manager as pm
 
@@ -133,11 +140,11 @@ def configure_printer_menu(cfg=None):
     else:
         max_q = current_max_queue
 
-    # Optional test print / connectivity verification
+    # Optional spooler status check
     print("\n" + "-" * 60)
     target_to_test = selected_name or pm.get_default_printer()
     if target_to_test:
-        test_ans = input(f"Would you like to test spooler connectivity for '{target_to_test}'? [y/N]: ").strip().lower()
+        test_ans = input(f"Would you like to check spooler status for '{target_to_test}'? [y/N]: ").strip().lower()
         if test_ans in ["y", "yes"]:
             print(f" [*] Querying Windows Spooler for '{target_to_test}'...")
             q_status = pm.get_queue_status(target_to_test)
@@ -146,7 +153,7 @@ def configure_printer_menu(cfg=None):
             if q_status['has_error']:
                 print(f"     Errors: {', '.join(q_status['error_reasons'])}")
             else:
-                print("     [+] Printer device is connected and responsive!")
+                print("     [+] Spooler reported no error flags.")
 
     # Save to config
     if "printing" not in cfg:
@@ -156,6 +163,7 @@ def configure_printer_menu(cfg=None):
     config_manager.save_config(cfg)
     print("\n[+] Printer configuration successfully saved to config.json!")
     return True
+
 
 def run_calibration_wizard():
     """
@@ -277,6 +285,7 @@ def run_calibration_wizard():
 
     print("\nCalibration Wizard finished successfully!")
     return True
+
 
 if __name__ == "__main__":
     run_calibration_wizard()

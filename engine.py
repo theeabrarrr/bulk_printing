@@ -19,12 +19,64 @@ import config_manager
 # Ensure failsafe is active (slam mouse into any corner to emergency abort)
 pyautogui.FAILSAFE = True
 
+# Global latch for ESC key press so brief taps during sleeps are never missed
+_ABORT_REQUESTED = False
+_ESC_HOOK_REGISTERED = False
+
+
+def _on_esc_pressed(event=None):
+    global _ABORT_REQUESTED
+    _ABORT_REQUESTED = True
+
+
+def _ensure_esc_listener():
+    global _ESC_HOOK_REGISTERED
+    if not _ESC_HOOK_REGISTERED:
+        try:
+            keyboard.on_press_key('esc', _on_esc_pressed, suppress=False)
+            _ESC_HOOK_REGISTERED = True
+        except Exception:
+            pass
+
+
+def reset_abort():
+    """Clears the latched ESC abort state before starting a new run."""
+    global _ABORT_REQUESTED
+    _ensure_esc_listener()
+    _ABORT_REQUESTED = False
+
+
+def check_abort():
+    """Checks if Esc is currently pressed or was latched for immediate abort."""
+    global _ABORT_REQUESTED
+    _ensure_esc_listener()
+    try:
+        if keyboard.is_pressed('esc'):
+            return True
+    except Exception:
+        pass
+    if _ABORT_REQUESTED:
+        _ABORT_REQUESTED = False
+        return True
+    return False
+
+
+def restore_erp_focus(timings=None):
+    """Restores foreground focus to the ERP window using the existing Alt+Tab mechanism."""
+    if timings is None:
+        timings = config_manager.DEFAULT_CONFIG["timings"]
+    print("[*] Switching back to ERP window using Alt+Tab...")
+    pyautogui.hotkey('alt', 'tab')
+    time.sleep(timings.get("window_switch_seconds", 2.0))
+
+
 def sanitize_technician_name(raw_name):
     """Sanitizes technician name for Windows folder path compatibility."""
     if not raw_name or not str(raw_name).strip() or str(raw_name).strip().lower() == "nan":
         return "Unknown"
     cleaned = re.sub(r'[\\/*?:"<>|]', "", str(raw_name).strip())
     return cleaned if cleaned else "Unknown"
+
 
 def get_completed_complaints(progress_file_path):
     """Reads completed complaints tracking file and returns a set of IDs."""
@@ -37,17 +89,81 @@ def get_completed_complaints(progress_file_path):
         print(f"[Warning] Failed to read {progress_file_path}: {e}")
         return set()
 
+
 def record_completed_complaint(progress_file_path, complaint_no):
     """Appends complaint number to the tracking file."""
     try:
+        parent_dir = os.path.dirname(progress_file_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(progress_file_path, "a", encoding="utf-8") as f:
             f.write(str(complaint_no).strip() + "\n")
     except Exception as e:
         print(f"[Warning] Failed to write {complaint_no} to {progress_file_path}: {e}")
 
-def check_abort():
-    """Checks if Esc is pressed for immediate abort."""
-    return keyboard.is_pressed('esc')
+
+def _dispatch_live_print(num, file_path, config, timings):
+    """
+    Executes queue-gated silent physical printing and job reconciliation for a saved PDF.
+    Ensures the ERP window is restored to the foreground after any interactive queue gate prompt.
+    Returns (printed_ok: bool, message: str).
+    """
+    import printer_manager as pm
+
+    printing_cfg = config_manager.get_printing_settings(config)
+    target_printer, is_fallback = config_manager.get_configured_printer(config)
+    tracker_file = config_manager.resolve_path(
+        printing_cfg.get("printed_tracker_file", "printed_complaints.txt")
+    )
+    max_queue = printing_cfg.get("max_spool_queue", 3)
+
+    if not target_printer:
+        print("[!] Warning: No Windows printer available for live printing.")
+        return False, f"No Windows printer available for live printing of #{num}."
+
+    fallback_note = " (System Default)" if is_fallback else ""
+    print(f"[*] Live Print: Checking spooler queue on '{target_printer}'{fallback_note}...")
+
+    try:
+        gate_ok = pm.enforce_queue_gate(target_printer, max_jobs=max_queue)
+    except KeyboardInterrupt:
+        return False, "Process aborted by user during print queue gate."
+
+    gate_was_interactive = bool(getattr(pm, "LAST_GATE_PROMPTED", False)) or not gate_ok
+
+    if not gate_ok:
+        if gate_was_interactive:
+            restore_erp_focus(timings)
+        print(f"[i] Live printing skipped for complaint #{num} by operator.")
+        return False, f"Live printing skipped for complaint #{num} by operator."
+
+    try:
+        doc_name = f"Complaint_{num}.pdf"
+        print(f"[*] Sending '{num}.pdf' to '{target_printer}'...")
+        job_id = pm.print_pdf_silent(file_path, target_printer, doc_name=doc_name)
+        if not job_id:
+            raise RuntimeError("Silent print did not return a valid spool job.")
+        pm.mark_complaint_spooled(
+            tracker_file, num, file_path, target_printer, job_id=job_id
+        )
+        confirmed, status_msg = pm.reconcile_print_job(
+            target_printer, job_id=job_id, doc_name=doc_name
+        )
+        if not confirmed:
+            raise RuntimeError(f"Print job not confirmed ({status_msg})")
+        if not pm.mark_complaint_printed(
+            tracker_file, num, file_path, target_printer, job_id=job_id
+        ):
+            raise RuntimeError(f"Failed to record confirmed print in '{tracker_file}'")
+        print(f"[✓] Complaint #{num} confirmed printed on '{target_printer}'.")
+        return True, f"{num} completed and printed successfully."
+    except Exception as print_err:
+        print(f"[!] Warning: Silent physical printing failed for #{num}: {print_err}")
+        return False, f"PDF saved, but physical printing failed for #{num}: {print_err}"
+    finally:
+        if gate_was_interactive:
+            restore_erp_focus(timings)
+
 
 def process_complaint(complaint_no, tech_name, config=None, record_progress=True, organize_by_tech=True, live_print=False):
     """
@@ -111,6 +227,9 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         pyautogui.click(x=ha_checkbox["x"], y=ha_checkbox["y"])
         time.sleep(timings.get("checkbox_wait_seconds", 1.0))
 
+        if check_abort():
+            return False, "Process aborted by user (Esc pressed)."
+
         # Step D: Popup Print Click
         popup_print = coords.get("popup_print_btn", {"x": 671, "y": 493})
         pyautogui.click(x=popup_print["x"], y=popup_print["y"])
@@ -170,9 +289,7 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             elapsed += 0.5
 
         # Step G: Cleanup & Record
-        print("[*] Switching back to ERP window using Alt+Tab...")
-        pyautogui.hotkey('alt', 'tab')
-        time.sleep(timings.get("window_switch_seconds", 2.0))
+        restore_erp_focus(timings)
 
         # Close the Print Module popup
         print("[*] Closing the Print Module...")
@@ -185,46 +302,32 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
             print(f"\n[!] Verification Failed: '{file_path}' was not created or is empty.")
             return False, f"PDF file not saved or 0 bytes: {file_path}"
 
-        # Write to tracking file if requested
+        # Write PDF completion to tracking file if requested
         if record_progress:
             record_completed_complaint(progress_file, num)
 
         print(f"[+] {num} successfully saved in {tech}'s folder!")
 
-        # Physical Silent Printing if live_print is enabled
+        # Physical Silent Printing if live_print is enabled (tracked separately in printed_complaints.txt)
         if live_print:
-            import printer_manager as pm
-            printing_cfg = config_manager.get_printing_settings(config)
-            target_printer, is_fallback = config_manager.get_configured_printer(config)
-            tracker_file = config_manager.resolve_path(printing_cfg.get("printed_tracker_file", "printed_complaints.txt"))
-            max_queue = printing_cfg.get("max_spool_queue", 3)
-
-            if target_printer:
-                fallback_note = " (System Default)" if is_fallback else ""
-                print(f"[*] Live Print: Checking spooler queue on '{target_printer}'{fallback_note}...")
-                gate_ok = pm.enforce_queue_gate(target_printer, max_jobs=max_queue)
-                if gate_ok:
-                    try:
-                        print(f"[*] Sending '{num}.pdf' to '{target_printer}'...")
-                        pm.print_pdf_silent(file_path, target_printer, doc_name=f"Complaint_{num}.pdf")
-                        pm.mark_complaint_printed(tracker_file, num, file_path, target_printer)
-                        print(f"[✓] Complaint #{num} successfully spooled to printer.")
-                    except Exception as print_err:
-                        print(f"[!] Warning: Silent physical printing failed for #{num}: {print_err}")
-                else:
-                    print(f"[i] Live printing skipped for complaint #{num} by operator.")
-            else:
-                print("[!] Warning: No Windows printer available for live printing.")
+            print_ok, print_msg = _dispatch_live_print(num, file_path, config, timings)
+            if not print_ok:
+                time.sleep(1.0)
+                return False, print_msg
 
         time.sleep(1.0)
         return True, f"{num} completed successfully."
 
+    except KeyboardInterrupt:
+        print("\n[!] Operation interrupted by user (Ctrl+C).")
+        return False, "Process aborted by user (Ctrl+C)."
     except pyautogui.FailSafeException:
         print("\n[!] Emergency FailSafe triggered (mouse in screen corner)!")
         return False, "Aborted by FailSafe"
     except Exception as e:
         print(f"\n[!] Error during processing of complaint {num}: {e}")
         return False, str(e)
+
 
 def generate_otp(complaint_no, config=None):
     """
@@ -325,6 +428,9 @@ def generate_otp(complaint_no, config=None):
         print(f"[+] OTP successfully generated for Complaint #{num}!")
         return True, f"OTP generated successfully for complaint #{num}"
 
+    except KeyboardInterrupt:
+        print("\n[!] OTP generation interrupted by user (Ctrl+C).")
+        return False, "Aborted by user (Ctrl+C)."
     except pyautogui.FailSafeException:
         print("\n[!] EMERGENCY STOP: PyAutoGUI FailSafe triggered (mouse in corner)!")
         return False, "Aborted by user (FailSafe triggered)."
@@ -332,11 +438,25 @@ def generate_otp(complaint_no, config=None):
         print(f"\n[!] Unexpected error during OTP generation: {e}")
         return False, f"OTP generation failed: {e}"
 
+
+def _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech):
+    """Locates an existing saved PDF for a complaint in the expected or alternate output folder."""
+    primary_folder = os.path.join(output_base, tech) if organize_by_tech else os.path.join(output_base, "All_PDFs")
+    alt_folder = os.path.join(output_base, "All_PDFs") if organize_by_tech else os.path.join(output_base, tech)
+
+    for folder in (primary_folder, alt_folder):
+        candidate = os.path.abspath(os.path.join(folder, f"{num}.pdf"))
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
+
+
 def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=True, live_print=False):
     """
     Executes batch processing for an iterable of (complaint_no, tech_name) records.
     Returns summary statistics dict: {'total', 'completed', 'skipped', 'failed', 'aborted'}.
     """
+    reset_abort()
     config_manager.set_dpi_awareness()
     if config is None:
         config = config_manager.load_config()
@@ -344,8 +464,23 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
             config = config_manager.DEFAULT_CONFIG
 
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
+    timings = config.get("timings", config_manager.DEFAULT_CONFIG["timings"])
+    output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
     progress_file = config_manager.resolve_path(settings.get("progress_file", "completed_complaints.txt"))
     completed_set = get_completed_complaints(progress_file)
+
+    printed_set = set()
+    if live_print:
+        import printer_manager as pm
+        printing_cfg = config_manager.get_printing_settings(config)
+        tracker_file = config_manager.resolve_path(
+            printing_cfg.get("printed_tracker_file", "printed_complaints.txt")
+        )
+        try:
+            printed_set = pm.load_printed_complaints(tracker_file)
+        except Exception as e:
+            print(f"[!] Warning: Could not load printed tracker '{tracker_file}': {e}")
+            printed_set = set()
 
     records = list(records_iterable)
     stats = {
@@ -361,42 +496,70 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
     print(f"[*] Folder Routing: {routing_label}")
     print(f"Auto-resume: {len(completed_set)} already completed records found.")
     print(f"Starting in {start_delay} seconds! Please ensure your ERP window is open and maximized...")
-    
-    for i in range(start_delay, 0, -1):
-        if check_abort():
-            print("\n[!] Aborted during countdown.")
-            stats["aborted"] = True
-            return stats
-        print(f"  Countdown: {i}...")
-        time.sleep(1.0)
 
-    for idx, (complaint_no, tech_name) in enumerate(records, 1):
-        num = str(complaint_no).strip()
-        tech = sanitize_technician_name(tech_name)
+    try:
+        for i in range(start_delay, 0, -1):
+            if check_abort():
+                print("\n[!] Aborted during countdown.")
+                stats["aborted"] = True
+                return stats
+            print(f"  Countdown: {i}...")
+            time.sleep(1.0)
 
-        if check_abort():
-            print("\n[!] Batch processing stopped by User (Esc pressed).")
-            stats["aborted"] = True
-            break
+        for idx, (complaint_no, tech_name) in enumerate(records, 1):
+            num = str(complaint_no).strip()
+            tech = sanitize_technician_name(tech_name)
 
-        if num in completed_set:
-            print(f"[>>] [{idx}/{len(records)}] {num} already done. Skipping...")
-            stats["skipped"] += 1
-            continue
-
-        print(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
-        success, msg = process_complaint(
-            num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech, live_print=live_print
-        )
-
-        if success:
-            completed_set.add(num)
-            stats["completed"] += 1
-        else:
-            if "aborted" in msg.lower() or "failsafe" in msg.lower():
+            if check_abort():
+                print("\n[!] Batch processing stopped by User (Esc pressed).")
                 stats["aborted"] = True
                 break
-            stats["failed"] += 1
+
+            if num in completed_set:
+                if not live_print or num in printed_set:
+                    print(f"[>>] [{idx}/{len(records)}] {num} already done. Skipping...")
+                    stats["skipped"] += 1
+                    continue
+
+                # Complaint PDF was completed previously, but is missing from printed tracker.
+                # Retry physical printing from saved PDF if present on disk.
+                saved_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+                if saved_pdf:
+                    print(f"\n[->] [{idx}/{len(records)}] Retrying print for saved PDF #{num} (Tech: {tech})")
+                    print_ok, print_msg = _dispatch_live_print(num, saved_pdf, config, timings)
+                    if print_ok:
+                        printed_set.add(num)
+                        stats["completed"] += 1
+                    else:
+                        if "aborted" in print_msg.lower() or "failsafe" in print_msg.lower():
+                            stats["aborted"] = True
+                            break
+                        stats["failed"] += 1
+                    continue
+
+            print(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
+            success, msg = process_complaint(
+                num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech, live_print=live_print
+            )
+
+            # Update in-memory sets based on actual persisted state
+            saved_pdf_now = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+            if saved_pdf_now:
+                completed_set.add(num)
+
+            if success:
+                completed_set.add(num)
+                if live_print:
+                    printed_set.add(num)
+                stats["completed"] += 1
+            else:
+                if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                    stats["aborted"] = True
+                    break
+                stats["failed"] += 1
+    except KeyboardInterrupt:
+        print("\n[!] Batch processing interrupted by user (Ctrl+C).")
+        stats["aborted"] = True
 
     print("\n" + "=" * 50)
     print("           BATCH EXECUTION SUMMARY")
@@ -409,6 +572,7 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
     print("=" * 50 + "\n")
 
     return stats
+
 
 if __name__ == "__main__":
     print("engine.py loaded. Testing functions...")

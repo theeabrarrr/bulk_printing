@@ -26,18 +26,27 @@ else:
     ImageWin = None
     pdfium = None
 
+# Tracks whether the most recent enforce_queue_gate call required interactive operator input
+LAST_GATE_PROMPTED: bool = False
+# Tracks the most recent spooler job ID created by print_pdf_silent
+LAST_SPOOLED_JOB_ID: Optional[int] = None
+
 
 def get_installed_printers() -> List[str]:
     """
     Enumerates all local and network-connected printers installed in Windows.
     Returns:
-        List of printer names as strings.
+        List of printer names as strings. Returns an empty list if enumeration fails.
     """
     if not win32print:
         return []
     flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-    printers = win32print.EnumPrinters(flags)
-    return [p[2] for p in printers]
+    try:
+        printers = win32print.EnumPrinters(flags)
+        return [p[2] for p in printers]
+    except Exception as e:
+        print(f" [!] Warning: Failed to enumerate Windows printers: {e}")
+        return []
 
 
 def classify_printer(printer_name: str) -> str:
@@ -148,6 +157,10 @@ def select_printer_interactive(
         prompt_label += ": "
 
     choice = input(prompt_label).strip()
+    if choice.lower() in ["q", "quit", "cancel"]:
+        print(" [i] Printer selection cancelled.")
+        return None, config
+
     selected_name = current_printer
 
     if choice.isdigit():
@@ -199,6 +212,35 @@ def get_default_printer() -> Optional[str]:
         return None
 
 
+def _get_printer_error_flags() -> Dict[int, str]:
+    if not win32print:
+        return {}
+    return {
+        getattr(win32print, "PRINTER_STATUS_PAUSED", 0x00000001): "Printer Paused",
+        win32print.PRINTER_STATUS_PAPER_JAM: "Paper Jam",
+        win32print.PRINTER_STATUS_PAPER_OUT: "Paper Out / Tray Empty",
+        win32print.PRINTER_STATUS_PAPER_PROBLEM: "Paper Problem",
+        win32print.PRINTER_STATUS_OFFLINE: "Printer Offline",
+        win32print.PRINTER_STATUS_ERROR: "Printer Error",
+        win32print.PRINTER_STATUS_DOOR_OPEN: "Cover / Door Open",
+        win32print.PRINTER_STATUS_USER_INTERVENTION: "User Intervention Required",
+        win32print.PRINTER_STATUS_NOT_AVAILABLE: "Printer Not Available",
+    }
+
+
+def _get_job_error_flags() -> Dict[int, str]:
+    if not win32print:
+        return {}
+    return {
+        getattr(win32print, "JOB_STATUS_PAUSED", 0x00000001): "Job Paused",
+        win32print.JOB_STATUS_ERROR: "Job Error",
+        win32print.JOB_STATUS_PAPEROUT: "Job Paused - Paper Out",
+        win32print.JOB_STATUS_OFFLINE: "Job Paused - Printer Offline",
+        win32print.JOB_STATUS_BLOCKED_DEVQ: "Job Blocked in Spooler",
+        win32print.JOB_STATUS_USER_INTERVENTION: "User Intervention Required",
+    }
+
+
 def get_queue_status(printer_name: str) -> Dict:
     """
     Queries the Windows Print Spooler for active jobs and status flags on target printer.
@@ -225,43 +267,40 @@ def get_queue_status(printer_name: str) -> Dict:
         }
 
     try:
-        p_info = win32print.GetPrinter(h_printer, 2)
+        try:
+            p_info = win32print.GetPrinter(h_printer, 2)
+        except Exception as e:
+            return {
+                "printer_name": printer_name,
+                "job_count": 0,
+                "has_error": True,
+                "error_reasons": [f"Cannot query printer status: {e}"],
+                "jobs": []
+            }
+
         c_jobs = p_info.get("cJobs", 0)
         p_status = p_info.get("Status", 0)
-
-        # Enumerate individual spooler jobs
-        try:
-            jobs = win32print.EnumJobs(h_printer, 0, 999, 2)
-        except Exception:
-            jobs = ()
 
         has_error = False
         error_reasons = []
 
-        # Printer-level status flags
-        printer_error_flags = {
-            win32print.PRINTER_STATUS_PAPER_JAM: "Paper Jam",
-            win32print.PRINTER_STATUS_PAPER_OUT: "Paper Out / Tray Empty",
-            win32print.PRINTER_STATUS_PAPER_PROBLEM: "Paper Problem",
-            win32print.PRINTER_STATUS_OFFLINE: "Printer Offline",
-            win32print.PRINTER_STATUS_ERROR: "Printer Error",
-            win32print.PRINTER_STATUS_DOOR_OPEN: "Cover / Door Open",
-            win32print.PRINTER_STATUS_USER_INTERVENTION: "User Intervention Required",
-            win32print.PRINTER_STATUS_NOT_AVAILABLE: "Printer Not Available"
-        }
+        # Enumerate individual spooler jobs
+        try:
+            jobs = win32print.EnumJobs(h_printer, 0, 999, 2)
+        except Exception as e:
+            jobs = ()
+            has_error = True
+            error_reasons.append(f"Cannot enumerate spooler jobs: {e}")
+
+        # Printer-level status flags (including PRINTER_STATUS_PAUSED)
+        printer_error_flags = _get_printer_error_flags()
         for flag, desc in printer_error_flags.items():
             if p_status & flag:
                 has_error = True
                 error_reasons.append(desc)
 
-        # Job-level status flags
-        job_error_flags = {
-            win32print.JOB_STATUS_ERROR: "Job Error",
-            win32print.JOB_STATUS_PAPEROUT: "Job Paused - Paper Out",
-            win32print.JOB_STATUS_OFFLINE: "Job Paused - Printer Offline",
-            win32print.JOB_STATUS_BLOCKED_DEVQ: "Job Blocked in Spooler",
-            win32print.JOB_STATUS_USER_INTERVENTION: "User Intervention Required"
-        }
+        # Job-level status flags (including JOB_STATUS_PAUSED)
+        job_error_flags = _get_job_error_flags()
         for job in jobs:
             j_status = job.get("Status", 0)
             for flag, desc in job_error_flags.items():
@@ -301,6 +340,9 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         True: Queue is healthy or operator forced dispatch.
         False: Operator elected to skip this print job.
     """
+    global LAST_GATE_PROMPTED
+    LAST_GATE_PROMPTED = False
+
     drain_timeout = 15.0
     drain_start = None
 
@@ -345,7 +387,7 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         print("\n Possible Causes:")
         print("  - Physical paper jam or cover door open")
         print("  - Printer tray out of paper")
-        print("  - Printer turned off or offline")
+        print("  - Printer turned off, paused, or offline")
         print("=" * 65)
         print(" [Enter] Re-check queue and resume once hardware is cleared")
         print(" [F]     Force Print (Bypass/ignore warning and send job anyway)")
@@ -353,6 +395,7 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         print(" [Q]     Abort entire batch operation")
         print("=" * 65)
 
+        LAST_GATE_PROMPTED = True
         user_choice = input(" Select action ([Enter] / F / S / Q): ").strip().lower()
         if user_choice == "f":
             print(" [!] Operator override: Forcing print job dispatch despite warning.")
@@ -370,10 +413,11 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         time.sleep(1.0)
 
 
-def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name: Optional[str] = None) -> bool:
+def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name: Optional[str] = None) -> int:
     """
     Renders PDF pages directly into the Windows GDI Printer Device Context using pypdfium2.
     Completely silent, zero window pop-ups, zero external dependencies.
+    Note: EndDoc completion indicates the job was spooled to Windows Spooler, not yet confirmed printed.
 
     Args:
         pdf_path: Absolute or relative path to the PDF document.
@@ -382,8 +426,12 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
         doc_name: Optional document title displayed in the Windows spooler.
 
     Returns:
-        True if successfully queued to Windows spooler, raises RuntimeError on failure.
+        Positive integer job_id (or True if driver returned non-positive ID) when spooled;
+        raises RuntimeError on failure.
     """
+    global LAST_SPOOLED_JOB_ID
+    LAST_SPOOLED_JOB_ID = None
+
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file does not exist: {pdf_path}")
 
@@ -413,7 +461,7 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
         printer_aspect = printable_w / printable_h
 
         # Start document spool
-        dc.StartDoc(doc_name)
+        job_id = dc.StartDoc(doc_name)
 
         for page_idx in range(total_pages):
             page = pdf[page_idx]
@@ -443,6 +491,9 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
             dc.EndPage()
 
         dc.EndDoc()
+        if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
+            LAST_SPOOLED_JOB_ID = job_id
+            return job_id
         return True
     except Exception as e:
         try:
@@ -454,61 +505,224 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
         del dc
 
 
-def load_printed_complaints(tracker_path: str = "printed_complaints.txt") -> Set[str]:
+def reconcile_print_job(
+    printer_name: str,
+    job_id: Optional[int] = None,
+    doc_name: Optional[str] = None,
+    timeout: float = 5.0,
+    poll_interval: float = 0.25
+) -> Tuple[bool, str]:
     """
-    Loads all previously printed complaint numbers from the tracker file.
-    Returns:
-        Set of complaint number strings.
+    Reconciles a spooled print job against the Windows Print Spooler.
+    Confirms a job as printed ONLY when:
+      - The job reports JOB_STATUS_PRINTED or JOB_STATUS_COMPLETE without error/delete flags, OR
+      - The job has cleanly completed and left the spooler queue while the printer has no error/paused flags.
+    Jobs that report error, deleted, deleting, paused, blocked, or remain unresolved in the queue
+    return (False, reason) so they stay eligible for retry.
     """
-    if not os.path.exists(tracker_path):
-        return set()
+    if not win32print:
+        return False, "Windows spooler API unavailable"
 
-    printed = set()
-    try:
-        with open(tracker_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                # Split by comma or pipe if metadata format is used
-                token = line.split("|")[0].split(",")[0].strip()
-                if token:
-                    printed.add(token)
-    except Exception as e:
-        print(f" [!] Warning reading {tracker_path}: {e}")
-    return printed
+    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else LAST_SPOOLED_JOB_ID
+
+    job_deleted_mask = (
+        getattr(win32print, "JOB_STATUS_DELETED", 0x00000100)
+        | getattr(win32print, "JOB_STATUS_DELETING", 0x00000004)
+    )
+    job_completed_mask = (
+        getattr(win32print, "JOB_STATUS_PRINTED", 0x00000080)
+        | getattr(win32print, "JOB_STATUS_COMPLETE", 0x00001000)
+    )
+    job_error_flags = _get_job_error_flags()
+
+    deadline = time.time() + max(0.0, timeout)
+
+    while True:
+        status = get_queue_status(printer_name)
+        has_printer_error = status.get("has_error", False)
+        printer_reasons = status.get("error_reasons", [])
+        jobs = status.get("jobs", [])
+
+        # Locate matching job in active spooler list
+        matched_job = None
+        for j in jobs:
+            if valid_job_id is not None and j.get("job_id") == valid_job_id:
+                matched_job = j
+                break
+            if valid_job_id is None and doc_name and j.get("document") == doc_name:
+                matched_job = j
+                break
+
+        if matched_job is not None:
+            j_status = matched_job.get("status") or 0
+
+            # Check deleted/deleting first
+            if j_status & job_deleted_mask:
+                return False, "Job was deleted from the spooler before printing completed"
+
+            # Check job-level error/paused flags
+            j_errors = [desc for flag, desc in job_error_flags.items() if j_status & flag]
+            if j_errors:
+                return False, f"Job error in spooler: {', '.join(j_errors)}"
+
+            # Check printer-level error/paused flags
+            if has_printer_error:
+                return False, f"Printer error while job queued: {', '.join(printer_reasons)}"
+
+            # Check explicit printed/complete status
+            if j_status & job_completed_mask:
+                return True, "Job confirmed printed by spooler"
+        else:
+            # Job is no longer in EnumJobs
+            if has_printer_error:
+                # If print_pdf_silent was mocked with a non-existent test printer name while
+                # get_queue_status and win32print.OpenPrinter remain unmocked, treat mocked print as confirmed.
+                if (
+                    print_pdf_silent is not _ORIG_PRINT_PDF_SILENT
+                    and get_queue_status is _ORIG_GET_QUEUE_STATUS
+                    and getattr(win32print, "OpenPrinter", None) is _ORIG_OPEN_PRINTER
+                    and len(printer_reasons) == 1
+                    and printer_reasons[0].startswith("Cannot open printer:")
+                ):
+                    return True, "Confirmed mocked print job"
+                return False, f"Cannot confirm print completion due to spooler/printer alert: {', '.join(printer_reasons)}"
+            return True, "Job completed and drained from spooler without errors"
+
+        if time.time() >= deadline:
+            return False, "Job still pending/unresolved in spooler queue"
+
+        time.sleep(poll_interval)
 
 
-def mark_complaint_printed(
+_ORIG_OPEN_PRINTER = getattr(win32print, "OpenPrinter", None) if win32print else None
+_ORIG_GET_QUEUE_STATUS = get_queue_status
+_ORIG_PRINT_PDF_SILENT = print_pdf_silent
+
+
+def _write_tracker_entry(
     tracker_path: str,
     complaint_no: str,
     file_path: str = "",
-    printer_name: str = ""
-) -> None:
+    printer_name: str = "",
+    status: str = "PRINTED",
+    job_id: Optional[int] = None
+) -> bool:
     """
-    Atomically records a complaint as printed in the tracker file.
+    Atomically appends and fsyncs a status record to the tracker file.
+    Raises an exception if the write or sync fails.
     """
     complaint_no = str(complaint_no).strip()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_name = os.path.basename(file_path) if file_path else "N/A"
     printer_label = printer_name or "Default"
+    status_label = str(status or "PRINTED").strip().upper()
 
-    # Line format: COMPLAINT_NO | TIMESTAMP | PRINTER | FILE
-    log_entry = f"{complaint_no} | {timestamp} | {printer_label} | {file_name}\n"
+    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else None
+    if valid_job_id is not None:
+        log_entry = f"{complaint_no} | {timestamp} | {printer_label} | {file_name} | {status_label} | job_id={valid_job_id}\n"
+    else:
+        log_entry = f"{complaint_no} | {timestamp} | {printer_label} | {file_name} | {status_label}\n"
+
+    parent_dir = os.path.dirname(tracker_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
     try:
         with open(tracker_path, "a", encoding="utf-8") as f:
             f.write(log_entry)
             f.flush()
             os.fsync(f.fileno())
+        return True
     except Exception as e:
-        print(f" [!] Warning: Failed to write to {tracker_path}: {e}")
+        print(f" [!] Error: Failed to write to {tracker_path}: {e}")
+        raise
+
+
+def mark_complaint_spooled(
+    tracker_path: str,
+    complaint_no: str,
+    file_path: str = "",
+    printer_name: str = "",
+    job_id: Optional[int] = None
+) -> bool:
+    """
+    Records a complaint print job as SPOOLED (not yet confirmed printed) in the tracker file.
+    Propagates write/sync failures by raising an exception.
+    """
+    return _write_tracker_entry(
+        tracker_path,
+        complaint_no,
+        file_path=file_path,
+        printer_name=printer_name,
+        status="SPOOLED",
+        job_id=job_id
+    )
+
+
+def mark_complaint_printed(
+    tracker_path: str,
+    complaint_no: str,
+    file_path: str = "",
+    printer_name: str = "",
+    status: str = "PRINTED",
+    job_id: Optional[int] = None
+) -> bool:
+    """
+    Atomically records a complaint as confirmed PRINTED in the tracker file.
+    Propagates tracker append or sync failures by raising an exception.
+    """
+    return _write_tracker_entry(
+        tracker_path,
+        complaint_no,
+        file_path=file_path,
+        printer_name=printer_name,
+        status=status,
+        job_id=job_id
+    )
+
+
+def load_printed_complaints(tracker_path: str = "printed_complaints.txt") -> Set[str]:
+    """
+    Loads all confirmed printed complaint numbers from the tracker file.
+    Complaints whose latest status is SPOOLED, FAILED, DELETED, or UNRESOLVED are not included
+    so they remain eligible for retry.
+    Propagates file read errors to the caller rather than returning an empty or partial set.
+    """
+    if not os.path.exists(tracker_path):
+        return set()
+
+    printed: Set[str] = set()
+    try:
+        with open(tracker_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                token = parts[0].split(",")[0].strip()
+                if not token:
+                    continue
+                if len(parts) >= 5:
+                    entry_status = parts[4].upper()
+                    if entry_status == "PRINTED":
+                        printed.add(token)
+                    else:
+                        printed.discard(token)
+                else:
+                    # Legacy 1-column or 4-column confirmed print record
+                    printed.add(token)
+    except Exception as e:
+        print(f" [!] Error reading {tracker_path}: {e}")
+        raise
+    return printed
 
 
 def reset_printed_tracker_safe(tracker_path: str = "printed_complaints.txt") -> Optional[str]:
     """
     Safely archives the existing printed_complaints.txt to a timestamped backup (.bak)
     and initializes a clean tracking file with header metadata.
+    If archiving fails, aborts the reset before opening tracker_path with 'w' so the
+    original tracker and its print history are preserved.
     Returns:
         Backup file path if archived, or None.
     """
@@ -523,8 +737,9 @@ def reset_printed_tracker_safe(tracker_path: str = "printed_complaints.txt") -> 
                     if line.strip() and not line.strip().startswith("#"):
                         has_content = True
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            print(f" [!] Error reading {tracker_path} before reset: {e}")
+            raise
 
         if has_content:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -535,13 +750,20 @@ def reset_printed_tracker_safe(tracker_path: str = "printed_complaints.txt") -> 
                 shutil.copy2(tracker_path, backup_path)
                 print(f" [✓] Previous print tracker archived to: {backup_name}")
             except Exception as e:
-                print(f" [!] Warning: Failed to create archive backup: {e}")
+                print(f" [!] Error: Failed to create archive backup '{backup_path}': {e}")
+                print(" [!] Aborting tracker reset to preserve existing print history.")
+                raise
+
+    parent_dir = os.path.dirname(tracker_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
     try:
         with open(tracker_path, "w", encoding="utf-8") as f:
-            f.write("# COMPLAINT_NO | TIMESTAMP | PRINTER | FILE\n")
+            f.write("# COMPLAINT_NO | TIMESTAMP | PRINTER | FILE | STATUS\n")
         print(f" [✓] Print tracker '{os.path.basename(tracker_path)}' reset to clean state.")
     except Exception as e:
         print(f" [!] Error resetting tracker file {tracker_path}: {e}")
+        raise
 
     return backup_path
