@@ -4,14 +4,20 @@ Modular Print Manager for Universal Silent Printing & Windows Spooler Queue Moni
 Uses in-process headless GDI rendering (pypdfium2 + win32ui) for zero-popup physical printing.
 """
 
+import gc
 import os
 import sys
 import time
 import winsound
 from datetime import datetime
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple, Callable, Any
 
 if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     import win32print
     import win32ui
     import win32con
@@ -319,7 +325,8 @@ def get_queue_status(printer_name: str) -> Dict:
                     "job_id": j.get("JobId"),
                     "document": j.get("pDocument"),
                     "status": j.get("Status"),
-                    "pages": j.get("TotalPages")
+                    "pages": j.get("TotalPages"),
+                    "pages_printed": j.get("PagesPrinted", 0)
                 }
                 for j in jobs
             ]
@@ -328,13 +335,23 @@ def get_queue_status(printer_name: str) -> Dict:
         win32print.ClosePrinter(h_printer)
 
 
-def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
+def enforce_queue_gate(
+    printer_name: str,
+    max_jobs: int = 3,
+    stall_timeout: float = 60.0,
+    on_poll: Optional[Callable[[Dict], None]] = None,
+    check_abort_fn: Optional[Callable[[], bool]] = None
+) -> bool:
     """
-    Hardware Failsafe Pre-Dispatch Gate.
-    Monitors the Windows Print Spooler.
-    If queue >= max_jobs and no hardware error, quietly auto-drains up to 15 seconds.
-    If queue remains saturated or a hardware error is detected, pauses execution,
-    emits audio beeps, and prompts the operator with options including Force Print [F].
+    Hardware Failsafe Pre-Dispatch Gate with Progress-Aware Sliding Window Pacing.
+    Monitors the Windows Print Spooler:
+    - If queue < max_jobs and no hardware error, immediately allows dispatch.
+    - If queue >= max_jobs and no hardware error, quietly paces dispatch while monitoring
+      queue progress (job count drops, front job ID advances, or pages printed increments).
+      Resets the stall timer whenever progress is observed so large batches print continuously
+      without false interruptions.
+    - If a hardware/spooler error is detected OR the queue remains completely frozen for
+      >= stall_timeout seconds, pauses execution, emits audio beeps, and prompts the operator.
 
     Returns:
         True: Queue is healthy or operator forced dispatch.
@@ -343,30 +360,56 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
     global LAST_GATE_PROMPTED
     LAST_GATE_PROMPTED = False
 
-    drain_timeout = 15.0
     drain_start = None
+    last_sig = None
 
     while True:
+        if check_abort_fn and check_abort_fn():
+            raise KeyboardInterrupt("Print queue operation aborted via Esc.")
+
         status = get_queue_status(printer_name)
+        if callable(on_poll):
+            on_poll(status)
+
         job_count = status.get("job_count", 0)
         has_error = status.get("has_error", False)
         error_reasons = status.get("error_reasons", [])
+        jobs_list = status.get("jobs", [])
 
         # Queue is healthy if jobs < max_jobs and no hardware error
         if job_count < max_jobs and not has_error:
             return True
 
-        # Smart Auto-Drain Wait: If queue is saturated but NO hardware error, wait quietly up to 15s
+        # Progress-Aware Auto-Drain Wait: If queue is full but NO hardware error, wait dynamically
         if not has_error and job_count >= max_jobs:
+            head_job = jobs_list[0] if jobs_list else {}
+            current_sig = (
+                job_count,
+                head_job.get("job_id"),
+                head_job.get("pages_printed", 0),
+                head_job.get("status", 0),
+            )
+
             if drain_start is None:
                 drain_start = time.time()
-                print(f" [i] Spooler queue has {job_count}/{max_jobs} active jobs. Waiting up to 15s for printer to drain...")
+                last_sig = current_sig
+                print(
+                    f" [i] Spooler buffer full ({job_count}/{max_jobs} active jobs). "
+                    f"Pacing dispatch while printer drains..."
+                )
+            elif current_sig != last_sig:
+                # Active progress observed in spooler; reset stall timer
+                drain_start = time.time()
+                last_sig = current_sig
 
             elapsed = time.time() - drain_start
-            if elapsed < drain_timeout:
-                time.sleep(1.5)
+            if elapsed < stall_timeout:
+                for _ in range(3):
+                    if check_abort_fn and check_abort_fn():
+                        raise KeyboardInterrupt("Print queue operation aborted via Esc.")
+                    time.sleep(0.5)
                 continue
-            # If elapsed >= drain_timeout, fall through to audible alert prompt
+            # If elapsed >= stall_timeout with zero progress, fall through to audible alert prompt
 
         # Audible warning (2 alert beeps)
         try:
@@ -383,7 +426,7 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         if error_reasons:
             print(f" Issues Detected  : {', '.join(error_reasons)}")
         else:
-            print(" Issues Detected  : Queue capacity saturated (Jobs pending processing)")
+            print(f" Issues Detected  : Spooler queue stalled for >{int(stall_timeout)}s without progress")
         print("\n Possible Causes:")
         print("  - Physical paper jam or cover door open")
         print("  - Printer tray out of paper")
@@ -409,6 +452,7 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
 
         # Reset drain timer for next check
         drain_start = None
+        last_sig = None
         print(" [i] Re-checking printer status...")
         time.sleep(1.0)
 
@@ -417,6 +461,8 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
     """
     Renders PDF pages directly into the Windows GDI Printer Device Context using pypdfium2.
     Completely silent, zero window pop-ups, zero external dependencies.
+    Explicitly releases native pypdfium2 bitmaps/pages/documents and Windows GDI DC handles
+    after each page/document to guarantee flat memory usage across large batches.
     Note: EndDoc completion indicates the job was spooled to Windows Spooler, not yet confirmed printed.
 
     Args:
@@ -443,87 +489,127 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
 
     # Open PDF document
     pdf = pdfium.PdfDocument(pdf_path)
-    total_pages = len(pdf)
-    if total_pages == 0:
-        raise ValueError(f"PDF contains 0 pages: {pdf_path}")
-
-    # Create printer device context
-    dc = win32ui.CreateDC()
     try:
-        dc.CreatePrinterDC(printer_name)
-    except Exception as e:
-        raise RuntimeError(f"Failed to create Printer Device Context for '{printer_name}': {e}")
+        total_pages = len(pdf)
+        if total_pages == 0:
+            raise ValueError(f"PDF contains 0 pages: {pdf_path}")
 
-    try:
-        # Printable area of target printer (pixels at printer resolution)
-        printable_w = dc.GetDeviceCaps(win32con.HORZRES)
-        printable_h = dc.GetDeviceCaps(win32con.VERTRES)
-        printer_aspect = printable_w / printable_h
-
-        # Start document spool
-        job_id = dc.StartDoc(doc_name)
-
-        for page_idx in range(total_pages):
-            page = pdf[page_idx]
-            page_w, page_h = page.get_size()
-            page_aspect = page_w / page_h
-
-            # Fit page inside printable area preserving aspect ratio
-            if page_aspect > printer_aspect:
-                target_w = printable_w
-                target_h = int(printable_w / page_aspect)
-            else:
-                target_h = printable_h
-                target_w = int(printable_h * page_aspect)
-
-            offset_x = (printable_w - target_w) // 2
-            offset_y = (printable_h - target_h) // 2
-
-            # Render page to high-DPI bitmap
-            scale = dpi / 72.0
-            bitmap = page.render(scale=scale)
-            pil_img = bitmap.to_pil().convert("RGB")
-            dib = ImageWin.Dib(pil_img)
-
-            # Stream into printer DC
-            dc.StartPage()
-            dib.draw(dc.GetHandleOutput(), (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
-            dc.EndPage()
-
-        dc.EndDoc()
-        if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
-            LAST_SPOOLED_JOB_ID = job_id
-            return job_id
-        return True
-    except Exception as e:
+        # Create printer device context
+        dc = win32ui.CreateDC()
         try:
-            dc.AbortDoc()
-        except Exception:
-            pass
-        raise RuntimeError(f"Error streaming PDF '{pdf_path}' to printer '{printer_name}': {e}")
+            dc.CreatePrinterDC(printer_name)
+        except Exception as e:
+            try:
+                dc.DeleteDC()
+            except Exception:
+                pass
+            del dc
+            raise RuntimeError(f"Failed to create Printer Device Context for '{printer_name}': {e}")
+
+        try:
+            # Printable area of target printer (pixels at printer resolution)
+            printable_w = dc.GetDeviceCaps(win32con.HORZRES)
+            printable_h = dc.GetDeviceCaps(win32con.VERTRES)
+            printer_aspect = printable_w / printable_h
+
+            # Start document spool
+            job_id = dc.StartDoc(doc_name)
+
+            for page_idx in range(total_pages):
+                page = None
+                bitmap = None
+                pil_img = None
+                dib = None
+                try:
+                    page = pdf[page_idx]
+                    page_w, page_h = page.get_size()
+                    page_aspect = page_w / page_h
+
+                    # Fit page inside printable area preserving aspect ratio
+                    if page_aspect > printer_aspect:
+                        target_w = printable_w
+                        target_h = int(printable_w / page_aspect)
+                    else:
+                        target_h = printable_h
+                        target_w = int(printable_h * page_aspect)
+
+                    offset_x = (printable_w - target_w) // 2
+                    offset_y = (printable_h - target_h) // 2
+
+                    # Render page to high-DPI bitmap
+                    scale = dpi / 72.0
+                    bitmap = page.render(scale=scale)
+                    pil_img = bitmap.to_pil().convert("RGB")
+                    dib = ImageWin.Dib(pil_img)
+
+                    # Stream into printer DC
+                    dc.StartPage()
+                    dib.draw(dc.GetHandleOutput(), (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
+                    dc.EndPage()
+                finally:
+                    del dib
+                    if pil_img is not None and hasattr(pil_img, "close"):
+                        try:
+                            pil_img.close()
+                        except Exception:
+                            pass
+                    del pil_img
+                    if bitmap is not None and hasattr(bitmap, "close"):
+                        try:
+                            bitmap.close()
+                        except Exception:
+                            pass
+                    del bitmap
+                    if page is not None and hasattr(page, "close"):
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                    del page
+
+            dc.EndDoc()
+            if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
+                LAST_SPOOLED_JOB_ID = job_id
+                return job_id
+            return True
+        except Exception as e:
+            try:
+                dc.AbortDoc()
+            except Exception:
+                pass
+            raise RuntimeError(f"Error streaming PDF '{pdf_path}' to printer '{printer_name}': {e}")
+        finally:
+            try:
+                dc.DeleteDC()
+            except Exception:
+                pass
+            del dc
     finally:
-        del dc
+        if hasattr(pdf, "close"):
+            try:
+                pdf.close()
+            except Exception:
+                pass
+        del pdf
+        gc.collect()
 
 
-def reconcile_print_job(
-    printer_name: str,
+def inspect_job_in_status(
+    status: Dict,
     job_id: Optional[int] = None,
-    doc_name: Optional[str] = None,
-    timeout: float = 5.0,
-    poll_interval: float = 0.25
-) -> Tuple[bool, str]:
+    doc_name: Optional[str] = None
+) -> Tuple[str, str]:
     """
-    Reconciles a spooled print job against the Windows Print Spooler.
-    Confirms a job as printed ONLY when:
-      - The job reports JOB_STATUS_PRINTED or JOB_STATUS_COMPLETE without error/delete flags, OR
-      - The job has cleanly completed and left the spooler queue while the printer has no error/paused flags.
-    Jobs that report error, deleted, deleting, paused, blocked, or remain unresolved in the queue
-    return (False, reason) so they stay eligible for retry.
+    Evaluates a single print job's state against a pre-fetched `get_queue_status` snapshot.
+    Returns (state, reason) where `state` is one of:
+      - 'CONFIRMED': Job completed (either reported JOB_STATUS_PRINTED/COMPLETE or drained cleanly without errors)
+      - 'FAILED'   : Job deleted/deleting, job error/paused flag set, or printer error/paused flag set
+      - 'PENDING'  : Job is still active in the spooler queue without errors
     """
     if not win32print:
-        return False, "Windows spooler API unavailable"
+        return "FAILED", "Windows spooler API unavailable"
 
-    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else LAST_SPOOLED_JOB_ID
+    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else None
 
     job_deleted_mask = (
         getattr(win32print, "JOB_STATUS_DELETED", 0x00000100)
@@ -535,63 +621,243 @@ def reconcile_print_job(
     )
     job_error_flags = _get_job_error_flags()
 
-    deadline = time.time() + max(0.0, timeout)
+    has_printer_error = status.get("has_error", False)
+    printer_reasons = status.get("error_reasons", [])
+    jobs = status.get("jobs", [])
+
+    # Locate matching job in active spooler list
+    matched_job = None
+    for j in jobs:
+        if valid_job_id is not None and j.get("job_id") == valid_job_id:
+            matched_job = j
+            break
+        if valid_job_id is None and doc_name and j.get("document") == doc_name:
+            matched_job = j
+            break
+
+    if matched_job is not None:
+        j_status = matched_job.get("status") or 0
+
+        # Check deleted/deleting first
+        if j_status & job_deleted_mask:
+            return "FAILED", "Job was deleted from the spooler before printing completed"
+
+        # Check job-level error/paused flags
+        j_errors = [desc for flag, desc in job_error_flags.items() if j_status & flag]
+        if j_errors:
+            return "FAILED", f"Job error in spooler: {', '.join(j_errors)}"
+
+        # Check printer-level error/paused flags
+        if has_printer_error:
+            return "FAILED", f"Printer error while job queued: {', '.join(printer_reasons)}"
+
+        # Check explicit printed/complete status
+        if j_status & job_completed_mask:
+            return "CONFIRMED", "Job confirmed printed by spooler"
+
+        return "PENDING", "Job actively queued/printing in spooler"
+    else:
+        # Job is no longer in EnumJobs
+        if has_printer_error:
+            if (
+                print_pdf_silent is not _ORIG_PRINT_PDF_SILENT
+                and get_queue_status is _ORIG_GET_QUEUE_STATUS
+                and getattr(win32print, "OpenPrinter", None) is _ORIG_OPEN_PRINTER
+                and len(printer_reasons) == 1
+                and printer_reasons[0].startswith("Cannot open printer:")
+            ):
+                return "CONFIRMED", "Confirmed mocked print job"
+            return "FAILED", f"Cannot confirm print completion due to spooler/printer alert: {', '.join(printer_reasons)}"
+        return "CONFIRMED", "Job completed and drained from spooler without errors"
+
+
+def reconcile_print_job(
+    printer_name: str,
+    job_id: Optional[int] = None,
+    doc_name: Optional[str] = None,
+    timeout: float = 30.0,
+    poll_interval: float = 0.25
+) -> Tuple[bool, str]:
+    """
+    Reconciles a spooled print job against the Windows Print Spooler.
+    Confirms a job as printed ONLY when:
+      - The job reports JOB_STATUS_PRINTED or JOB_STATUS_COMPLETE without error/delete flags, OR
+      - The job has cleanly completed and left the spooler queue while the printer has no error/paused flags.
+    Resets the timeout window whenever active queue progress is observed (e.g., earlier jobs finish
+    or pages_printed increments) so fuser warmup or multi-page jobs do not false-fail.
+    """
+    if not win32print:
+        return False, "Windows spooler API unavailable"
+
+    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else LAST_SPOOLED_JOB_ID
+    effective_window = max(0.0, timeout)
+    deadline = time.time() + effective_window
+    last_sig = None
 
     while True:
         status = get_queue_status(printer_name)
-        has_printer_error = status.get("has_error", False)
-        printer_reasons = status.get("error_reasons", [])
+        state, msg = inspect_job_in_status(status, job_id=valid_job_id, doc_name=doc_name)
+
+        if state == "CONFIRMED":
+            return True, msg
+        if state == "FAILED":
+            return False, msg
+
+        # Job is PENDING: check if queue or page progress occurred to extend deadline
         jobs = status.get("jobs", [])
-
-        # Locate matching job in active spooler list
-        matched_job = None
-        for j in jobs:
-            if valid_job_id is not None and j.get("job_id") == valid_job_id:
-                matched_job = j
-                break
-            if valid_job_id is None and doc_name and j.get("document") == doc_name:
-                matched_job = j
-                break
-
-        if matched_job is not None:
-            j_status = matched_job.get("status") or 0
-
-            # Check deleted/deleting first
-            if j_status & job_deleted_mask:
-                return False, "Job was deleted from the spooler before printing completed"
-
-            # Check job-level error/paused flags
-            j_errors = [desc for flag, desc in job_error_flags.items() if j_status & flag]
-            if j_errors:
-                return False, f"Job error in spooler: {', '.join(j_errors)}"
-
-            # Check printer-level error/paused flags
-            if has_printer_error:
-                return False, f"Printer error while job queued: {', '.join(printer_reasons)}"
-
-            # Check explicit printed/complete status
-            if j_status & job_completed_mask:
-                return True, "Job confirmed printed by spooler"
-        else:
-            # Job is no longer in EnumJobs
-            if has_printer_error:
-                # If print_pdf_silent was mocked with a non-existent test printer name while
-                # get_queue_status and win32print.OpenPrinter remain unmocked, treat mocked print as confirmed.
-                if (
-                    print_pdf_silent is not _ORIG_PRINT_PDF_SILENT
-                    and get_queue_status is _ORIG_GET_QUEUE_STATUS
-                    and getattr(win32print, "OpenPrinter", None) is _ORIG_OPEN_PRINTER
-                    and len(printer_reasons) == 1
-                    and printer_reasons[0].startswith("Cannot open printer:")
-                ):
-                    return True, "Confirmed mocked print job"
-                return False, f"Cannot confirm print completion due to spooler/printer alert: {', '.join(printer_reasons)}"
-            return True, "Job completed and drained from spooler without errors"
+        head_job = jobs[0] if jobs else {}
+        curr_sig = (
+            status.get("job_count", 0),
+            head_job.get("job_id"),
+            head_job.get("pages_printed", 0),
+        )
+        if last_sig is None:
+            last_sig = curr_sig
+        elif curr_sig != last_sig:
+            last_sig = curr_sig
+            deadline = time.time() + effective_window
 
         if time.time() >= deadline:
             return False, "Job still pending/unresolved in spooler queue"
 
         time.sleep(poll_interval)
+
+
+def reconcile_in_flight_jobs(
+    printer_name: str,
+    in_flight: List[Dict[str, Any]],
+    tracker_file: str,
+    status: Optional[Dict] = None
+) -> Tuple[int, List[Tuple[str, str]]]:
+    """
+    Checks all currently in-flight spooled jobs against the Windows Spooler.
+    - Jobs that are CONFIRMED are immediately recorded as PRINTED in `tracker_file`
+      and removed from `in_flight`.
+    - Jobs that have FAILED (deleted, error flag, printer error) are removed from
+      `in_flight` and returned in `failed_jobs` so they stay eligible for retry.
+    - Jobs still PENDING remain in `in_flight` while the printer continues processing.
+
+    Returns:
+        (newly_confirmed_count, list_of_(complaint_no, failure_reason))
+    """
+    if not in_flight:
+        return 0, []
+
+    if status is None:
+        status = get_queue_status(printer_name)
+
+    confirmed_now = 0
+    failed_now: List[Tuple[str, str]] = []
+    remaining: List[Dict[str, Any]] = []
+
+    for item in in_flight:
+        c_num = item["complaint_no"]
+        p_path = item["file_path"]
+        j_id = item.get("job_id")
+        d_name = item.get("doc_name")
+
+        state, reason = inspect_job_in_status(status, job_id=j_id, doc_name=d_name)
+        if state == "CONFIRMED":
+            if not mark_complaint_printed(
+                tracker_file, c_num, p_path, printer_name, job_id=j_id
+            ):
+                raise RuntimeError(f"Failed to record confirmed print for #{c_num} in '{tracker_file}'.")
+            confirmed_now += 1
+            print(f"  [✓] Complaint #{c_num} confirmed printed on {printer_name}.")
+        elif state == "FAILED":
+            failed_now.append((c_num, reason))
+            print(f"  [!] Complaint #{c_num} print not confirmed ({reason}); kept eligible for retry.")
+        else:
+            remaining.append(item)
+
+    in_flight[:] = remaining
+    return confirmed_now, failed_now
+
+
+def drain_in_flight_jobs(
+    printer_name: str,
+    in_flight: List[Dict[str, Any]],
+    tracker_file: str,
+    stall_timeout: float = 60.0,
+    poll_interval: float = 0.4,
+    check_abort_fn: Optional[Callable[[], bool]] = None
+) -> Tuple[int, List[Tuple[str, str]], bool]:
+    """
+    Waits for all remaining in-flight spooled jobs at the end of a batch to complete
+    and reconciles each into `tracker_file`.
+    Resets the stall timer whenever a job completes or spooler progress occurs.
+    If a hardware error occurs or the queue stalls for >= stall_timeout seconds,
+    surfaces the interactive queue gate so the operator can clear the printer and resume.
+
+    Returns:
+        (confirmed_count, failed_list, aborted_bool)
+    """
+    total_confirmed = 0
+    total_failed: List[Tuple[str, str]] = []
+    if not in_flight:
+        return 0, [], False
+
+    print(f"\n[*] Waiting for {len(in_flight)} remaining spooled job(s) to finish printing on '{printer_name}'...")
+    stall_start = time.time()
+    last_sig = None
+
+    while in_flight:
+        if check_abort_fn and check_abort_fn():
+            print("\n[!] Spooler drain interrupted by user (Esc pressed).")
+            return total_confirmed, total_failed, True
+
+        status = get_queue_status(printer_name)
+        has_error = status.get("has_error", False)
+
+        # If there is no hardware error, reconcile any jobs that finished
+        if not has_error:
+            c_now, f_now = reconcile_in_flight_jobs(printer_name, in_flight, tracker_file, status=status)
+            total_confirmed += c_now
+            total_failed.extend(f_now)
+            if not in_flight:
+                break
+
+        jobs_list = status.get("jobs", [])
+        head_job = jobs_list[0] if jobs_list else {}
+        curr_sig = (
+            len(in_flight),
+            status.get("job_count", 0),
+            head_job.get("job_id"),
+            head_job.get("pages_printed", 0),
+            head_job.get("status", 0),
+        )
+
+        if last_sig is None or curr_sig != last_sig:
+            last_sig = curr_sig
+            stall_start = time.time()
+
+        # If hardware error or stall timeout reached while jobs remain in flight, prompt operator
+        if has_error or (time.time() - stall_start >= stall_timeout):
+            try:
+                gate_ok = enforce_queue_gate(
+                    printer_name,
+                    max_jobs=0,
+                    stall_timeout=0.0,
+                    check_abort_fn=check_abort_fn
+                )
+            except KeyboardInterrupt:
+                return total_confirmed, total_failed, True
+
+            if not gate_ok:
+                # Operator pressed [S] to skip waiting on remaining unconfirmed jobs
+                for item in list(in_flight):
+                    c_num = item["complaint_no"]
+                    total_failed.append((c_num, "Skipped during final spooler drain by operator"))
+                in_flight.clear()
+                break
+
+            stall_start = time.time()
+            last_sig = None
+            continue
+
+        time.sleep(poll_interval)
+
+    return total_confirmed, total_failed, False
 
 
 _ORIG_OPEN_PRINTER = getattr(win32print, "OpenPrinter", None) if win32print else None
