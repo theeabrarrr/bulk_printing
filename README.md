@@ -8,7 +8,7 @@ Version 5.0 introduces **Universal Silent Physical Printing**:
 - **Job-Status Reconciliation**: Records jobs as `SPOOLED` when `EndDoc` completes and only marks them as `PRINTED` in `printed_complaints.txt` after reconciling with the Windows Spooler that the job completed without error or deletion.
 - **Dual Printing Modes**:
   - **Live Print**: Option to print each PDF immediately after download in Bulk and Manual modes, with automatic resume retry for any completed PDFs missing from `printed_complaints.txt`.
-  - **Offline Batch Print**: Main Menu option `[5]` to scan `Today_Complaints/` and print unprinted documents with automatic resume capability via `printed_complaints.txt`.
+  - **Offline Batch Print**: Main Menu option `[5]` to select specific Technician folder(s) (single, multi-select, or all) inside `Today_Complaints/` with live `[Total | Printed | Pending]` counts and continuous Sliding-Window Spooling.
 - **Printer Calibration & Setup**: Setup Wizard sub-menu and Main Menu option `[6]` to detect, select, and configure connected physical printers.
 
 ---
@@ -33,7 +33,7 @@ Ensure the following files are in the `ERP_Automation_Suite` folder:
    - **`[2] Manual Mode (Process single/batch complaint #s)`**: Prompts for one or multiple comma/space-separated complaint numbers (e.g. `2826001 2826002, 2826003`), deduplicates them, and processes them sequentially with optional live physical printing.
    - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard to calibrate screen coordinates or configure physical printer and queue limits.
    - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint number and automates OTP generation in Oracle Forms in a continuous loop.
-   - **`[5] Batch Print Offline PDFs (Today_Complaints)`**: Scans existing PDFs in `Today_Complaints/`, cross-references against `printed_complaints.txt`, and silent-prints unprinted documents.
+   - **`[5] Batch Print Offline PDFs (Today_Complaints)`**: Lists Technician folders inside `Today_Complaints/` with `[Total | Printed | Pending]` counts, lets you pick one or more folders (or all), and silent-prints unprinted documents using a progress-aware sliding-window spooler pipeline.
    - **`[6] Select / Change Target Printer`**: Lists installed Windows printers and updates the configured target printer in `config.json`.
    - **`[7] Exit`**: Closes the program.
 

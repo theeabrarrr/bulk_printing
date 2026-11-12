@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import subprocess
+import tempfile
 
 try:
     import config_manager
@@ -17,6 +18,13 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "ERP_Automation_Suite"
 EXE_NAME = "ERP_Automation_Suite"
 ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
+RUNTIME_PRESERVE_ITEMS = [
+    "config.json",
+    "complaints.xlsx",
+    "completed_complaints.txt",
+    "printed_complaints.txt",
+    "Today_Complaints",
+]
 
 
 def check_pyinstaller():
@@ -63,6 +71,47 @@ def verify_frozen_path_anchoring():
         sys.executable = orig_executable
 
 
+def _backup_runtime_data(suite_dir, backup_dir):
+    """Preserves existing runtime files and Today_Complaints/ before PyInstaller wipes suite_dir."""
+    preserved = []
+    if not os.path.exists(suite_dir):
+        return preserved
+
+    items_to_check = list(RUNTIME_PRESERVE_ITEMS)
+    try:
+        for entry in os.listdir(suite_dir):
+            if entry.startswith("printed_complaints_") and entry.endswith(".bak"):
+                if entry not in items_to_check:
+                    items_to_check.append(entry)
+    except Exception:
+        pass
+
+    for item in items_to_check:
+        src = os.path.join(suite_dir, item)
+        if os.path.exists(src):
+            dst = os.path.join(backup_dir, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            preserved.append(item)
+    return preserved
+
+
+def _restore_runtime_data(backup_dir, suite_dir, preserved_items):
+    """Restores preserved runtime files and Today_Complaints/ into suite_dir after build."""
+    os.makedirs(suite_dir, exist_ok=True)
+    for item in preserved_items:
+        src = os.path.join(backup_dir, item)
+        dst = os.path.join(suite_dir, item)
+        if os.path.exists(src):
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            print(f"  [*] Preserved existing runtime data: {dst}")
+
+
 def build_executable():
     """Runs PyInstaller to package main.py into a standalone --onedir suite."""
     print("=" * 60)
@@ -77,6 +126,7 @@ def build_executable():
         return False
 
     dist_root = os.path.join(PROJECT_DIR, "dist")
+    suite_dir = os.path.join(dist_root, PACKAGE_NAME)
     cmd = [
         sys.executable,
         "-m",
@@ -118,26 +168,30 @@ def build_executable():
         ENTRY_SCRIPT,
     ]
 
-    print(f"\nRunning command:\n  {' '.join(cmd)}\n")
-    result = subprocess.run(cmd, cwd=PROJECT_DIR)
+    with tempfile.TemporaryDirectory() as backup_dir:
+        preserved_items = _backup_runtime_data(suite_dir, backup_dir)
+        if preserved_items:
+            print(f"\n[*] Backed up {len(preserved_items)} runtime item(s) from '{suite_dir}': {', '.join(preserved_items)}")
+
+        print(f"\nRunning command:\n  {' '.join(cmd)}\n")
+        result = subprocess.run(cmd, cwd=PROJECT_DIR)
+
+        if preserved_items:
+            _restore_runtime_data(backup_dir, suite_dir, preserved_items)
 
     if result.returncode != 0:
         print(f"\n[!] Build failed with exit code {result.returncode}.")
         return False
 
-    suite_dir = os.path.join(dist_root, PACKAGE_NAME)
     exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
 
     if os.path.exists(exe_path):
         # Copy default config.json only if not already present in dist/ERP_Automation_Suite/ (preserves user calibration)
         src_cfg = os.path.join(PROJECT_DIR, "config.json")
         dest_cfg = os.path.join(suite_dir, "config.json")
-        if os.path.exists(src_cfg):
-            if not os.path.exists(dest_cfg):
-                shutil.copy2(src_cfg, dest_cfg)
-                print(f"  [+] Config initialized: {dest_cfg}")
-            else:
-                print(f"  [*] Preserved existing calibrated config: {dest_cfg}")
+        if os.path.exists(src_cfg) and not os.path.exists(dest_cfg):
+            shutil.copy2(src_cfg, dest_cfg)
+            print(f"  [+] Config initialized: {dest_cfg}")
 
         # Copy sample/active complaints.xlsx if not present in suite folder
         src_xlsx = os.path.join(PROJECT_DIR, "complaints.xlsx")

@@ -39,7 +39,7 @@ In Phase 5, we integrate **Universal Silent Physical Printing**:
 5. **Resume Tracking & Job Reconciliation (`printed_complaints.txt`)**: Track PDF completion (`completed_complaints.txt`) separately from print completion (`printed_complaints.txt`). Record jobs as `SPOOLED` upon `EndDoc` and reconcile against the spooler before recording `PRINTED`, keeping failed, deleted, or unresolved jobs eligible for retry.
 6. **Dual Print Integration**:
    - **Live Print**: Immediately spools and reconciles PDF upon download in Bulk Mode `[1]` and Manual Mode `[2]`, and retries unprinted saved PDFs upon resume.
-   - **Offline Batch Print**: Main Menu option `[5]` to scan `Today_Complaints/` and silent-print unprinted documents.
+   - **Offline Batch Print**: Main Menu option `[5]` to discover Technician subfolders inside `Today_Complaints/`, display per-folder `[Total | Printed | Pending]` counts, support single/multi/all folder selection, and stream documents via a progress-aware Sliding-Window Spooler Pipeline (`reconcile_in_flight_jobs` + `drain_in_flight_jobs`).
 7. **One-Dir Packaging**: Update `build.py` to bundle `pypdfium2` DLLs and `pywin32` runtime modules into `dist/ERP_Automation_Suite/`.
 
 ---
