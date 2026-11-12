@@ -373,13 +373,83 @@ def run_otp_mode(config):
         print("\n[!] OTP mode interrupted by user (Ctrl+C). Returning to main menu...")
 
 
+def _discover_technician_folders(output_dir, printed_set):
+    """
+    Scans output_dir for Technician subdirectories (and any root-level PDFs).
+    Returns a list of dicts:
+        {
+            "name": str,
+            "path": str,
+            "pdf_files": List[str],
+            "total": int,
+            "printed": int,
+            "pending": List[Tuple[str, str, str]]  # (complaint_no, pdf_path, folder_name)
+        }
+    """
+    folders = []
+
+    if not os.path.exists(output_dir):
+        return folders
+
+    # 1. Check root-level PDFs directly inside output_dir
+    try:
+        entries = sorted(os.listdir(output_dir))
+    except Exception:
+        return folders
+
+    root_pdfs = []
+    subdirs = []
+    for entry in entries:
+        full_path = os.path.join(output_dir, entry)
+        if os.path.isfile(full_path):
+            if entry.lower().endswith(".pdf") and not entry.startswith("._"):
+                root_pdfs.append(full_path)
+        elif os.path.isdir(full_path):
+            subdirs.append((entry, full_path))
+
+    def _build_folder_record(folder_name, folder_path, pdf_list):
+        sorted_pdfs = sorted(pdf_list)
+        printed_cnt = 0
+        pending_list = []
+        for p_path in sorted_pdfs:
+            base_name = os.path.splitext(os.path.basename(p_path))[0]
+            if base_name in printed_set:
+                printed_cnt += 1
+            else:
+                pending_list.append((base_name, p_path, folder_name))
+        return {
+            "name": folder_name,
+            "path": folder_path,
+            "pdf_files": sorted_pdfs,
+            "total": len(sorted_pdfs),
+            "printed": printed_cnt,
+            "pending": pending_list,
+        }
+
+    if root_pdfs:
+        folders.append(_build_folder_record("(Root Folder)", output_dir, root_pdfs))
+
+    # 2. Scan each technician subdirectory
+    for sub_name, sub_path in subdirs:
+        sub_pdfs = []
+        for root, _, files in os.walk(sub_path):
+            for f in files:
+                if f.lower().endswith(".pdf") and not f.startswith("._"):
+                    sub_pdfs.append(os.path.join(root, f))
+        if sub_pdfs:
+            folders.append(_build_folder_record(sub_name, sub_path, sub_pdfs))
+
+    return folders
+
+
 def run_batch_print_mode(config):
     """
-    Offline Batch Printing:
-    Recursively scans Today_Complaints/ folder for existing PDFs,
-    cross-references against printed_complaints.txt, and silent-prints
-    unprinted PDFs directly to the target Windows printer using the
-    Spooler Queue Gate hardware failsafe.
+    Offline Batch Printing (Technician-Wise & Sliding-Window Spooling):
+    Scans Today_Complaints/ for Technician subfolders, displays a live status
+    table ([Total | Printed | Pending]), allows single/multi/all folder selection,
+    and dispatches PDFs using the Sliding-Window Spooler Pipeline.
+    Loops back to the Technician Folder Selection menu after each batch until
+    the operator exits to the Main Menu.
     """
     engine.reset_abort()
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
@@ -399,195 +469,352 @@ def run_batch_print_mode(config):
             is_fallback = False
 
         output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-        tracker_file = config_manager.resolve_path(printing_settings.get("printed_tracker_file", "printed_complaints.txt"))
+        tracker_file = config_manager.resolve_path(
+            printing_settings.get("printed_tracker_file", "printed_complaints.txt")
+        )
         max_queue = printing_settings.get("max_spool_queue", 3)
 
         if not os.path.exists(output_dir):
             print(f"\n[!] Output directory '{output_dir}' does not exist. No PDFs to print.")
             return
 
-        # Recursively gather all PDF documents
-        pdf_files = []
-        for root, _, files in os.walk(output_dir):
-            for f in files:
-                if f.lower().endswith(".pdf") and not f.startswith("._"):
-                    pdf_files.append(os.path.join(root, f))
+        while True:
+            engine.reset_abort()
 
-        if not pdf_files:
-            print(f"\n[!] No PDF documents found in '{output_dir}'.")
-            return
-
-        # Load tracker state (propagate read errors instead of continuing with empty/partial set)
-        try:
-            printed_set = printer_manager.load_printed_complaints(tracker_file)
-        except Exception as e:
-            print(f"\n[!] Error: Cannot read print tracker '{tracker_file}': {e}")
-            print("    Batch printing aborted to prevent duplicate physical prints.")
-            return
-
-        pending_jobs = []
-        already_printed_count = 0
-
-        for p_path in sorted(pdf_files):
-            base_name = os.path.splitext(os.path.basename(p_path))[0]
-            if base_name in printed_set:
-                already_printed_count += 1
-            else:
-                pending_jobs.append((base_name, p_path))
-
-        p_cat = printer_manager.classify_printer(target_printer)
-        fallback_str = " (Auto-Detected)" if is_fallback else ""
-        print("\n" + "=" * 60)
-        print("        OFFLINE BATCH PRINTING (Today_Complaints)")
-        print("=" * 60)
-        print(f" Target Printer   : {target_printer} [{p_cat}]{fallback_str}")
-        print(f" Directory Scanned: {output_dir}")
-        print(f" Total PDFs Found : {len(pdf_files)}")
-        print(f" Already Printed  : {already_printed_count}")
-        print(f" Pending to Print : {len(pending_jobs)}")
-        print(f" Spooler Threshold: {max_queue} active jobs")
-        print("=" * 60)
-
-        # Smart prompt when previously printed documents exist
-        if already_printed_count > 0 and pending_jobs:
-            print(f"\n [i] Notice: {already_printed_count} of {len(pdf_files)} document(s) were previously printed.")
-            print(" Options: [Enter] Print pending only | [A] Force re-print all | [R] Reset print tracker | [C] Change printer")
-            act = input(" Select action ([Enter] / A / R / C): ").strip().lower()
-            if act == "c":
-                target_printer, config = _select_validated_physical_printer(
-                    config, initial_printer=target_printer, force_prompt=True
-                )
-                if not target_printer:
-                    print("[!] Batch printing cancelled: No physical printer selected.")
-                    return
-            elif act == "a":
-                pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
-                print(f" [*] Queuing all {len(pending_jobs)} documents for re-printing...")
-            elif act == "r":
-                try:
-                    printer_manager.reset_printed_tracker_safe(tracker_file)
-                except Exception as e:
-                    print(f" [!] Tracker reset aborted: {e}")
-                    return
-                pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
-                print(f" [*] Print tracker reset! All {len(pending_jobs)} documents will be printed.")
-        elif not pending_jobs:
-            print("\n[✓] All PDFs in 'Today_Complaints' have already been printed according to tracker!")
-            print(" Options: [A] Force re-print all | [R] Reset print tracker | [C] Change printer | [Enter] Return to menu")
-            reprint_ans = input(" Select action (A / R / C / [Enter]): ").strip().lower()
-            if reprint_ans == "a":
-                pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
-                print(f" [*] Queuing all {len(pending_jobs)} documents for re-printing...")
-            elif reprint_ans == "r":
-                try:
-                    printer_manager.reset_printed_tracker_safe(tracker_file)
-                except Exception as e:
-                    print(f" [!] Tracker reset aborted: {e}")
-                    return
-                pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
-                print(f" [*] Print tracker reset! All {len(pending_jobs)} documents queued for printing...")
-            elif reprint_ans == "c":
-                target_printer, config = _select_validated_physical_printer(
-                    config, initial_printer=target_printer, force_prompt=True
-                )
-                if not target_printer:
-                    return
-                return run_batch_print_mode(config)
-            else:
-                print(" Returning to main menu.")
+            # Load tracker state on each menu cycle so counts stay up to date
+            try:
+                printed_set = printer_manager.load_printed_complaints(tracker_file)
+            except Exception as e:
+                print(f"\n[!] Error: Cannot read print tracker '{tracker_file}': {e}")
+                print("    Batch printing aborted to prevent duplicate physical prints.")
                 return
 
-        confirm = input(f"\nProceed with printing {len(pending_jobs)} document(s) to '{target_printer}'? (Y/n) [or C to change]: ").strip().lower()
-        if confirm == "c":
-            target_printer, config = _select_validated_physical_printer(
-                config, initial_printer=target_printer, force_prompt=True
+            folders = _discover_technician_folders(output_dir, printed_set)
+            if not folders:
+                print(f"\n[!] No PDF documents found in '{output_dir}'.")
+                return
+
+            total_all = sum(f["total"] for f in folders)
+            printed_all = sum(f["printed"] for f in folders)
+            pending_all = sum(len(f["pending"]) for f in folders)
+
+            p_cat = printer_manager.classify_printer(target_printer)
+            fallback_str = " (Auto-Detected)" if is_fallback else ""
+
+            print("\n" + "=" * 70)
+            print("        OFFLINE BATCH PRINTING - SELECT TECHNICIAN FOLDER")
+            print("=" * 70)
+            print(f" Target Printer   : {target_printer} [{p_cat}]{fallback_str}")
+            print(f" Base Directory   : {output_dir}")
+            print(f" Spooler Window   : Up to {max_queue} active jobs (Sliding-Window Pipeline)")
+            print("-" * 70)
+            print(f"  {'#':<5} {'Technician Folder':<34} {'Total':>7} {'Printed':>9} {'Pending':>9}")
+            print("-" * 70)
+            for idx, f_info in enumerate(folders, 1):
+                idx_label = f"[{idx}]"
+                f_name = f_info["name"]
+                if len(f_name) > 32:
+                    f_name = f_name[:29] + "..."
+                print(
+                    f"  {idx_label:<5} {f_name:<34} {f_info['total']:>7} "
+                    f"{f_info['printed']:>9} {len(f_info['pending']):>9}"
+                )
+            print("-" * 70)
+            print(
+                f"  {'[A]':<5} {'All Folders (Combined)':<34} {total_all:>7} "
+                f"{printed_all:>9} {pending_all:>9}"
             )
-            if not target_printer:
-                print(" [!] Batch printing cancelled: No physical printer selected.")
-                return
-            confirm = input(f"Proceed with printing to '{target_printer}'? (Y/n) [Default: Y]: ").strip().lower()
+            print("-" * 70)
+            print("  [R] Reset Global Print Tracker   [C] Change Printer   [Q] Main Menu")
+            print("=" * 70)
 
-        if confirm not in ["", "y", "yes"]:
-            print(" [!] Batch printing cancelled by operator.")
-            return
+            sel_raw = input(
+                f"Select folder(s) (1-{len(folders)}, e.g. 1 or 1,2 | A=All | R=Reset | C=Printer | [Enter]/Q=Menu): "
+            ).strip()
 
-        print("\n[*] Starting batch printing in 3 seconds! Press [ESC] at any time to abort...")
-        for i in range(3, 0, -1):
-            if engine.check_abort():
-                print("\n[!] Aborted during countdown.")
+            if not sel_raw or sel_raw.lower() in ["q", "quit", "exit"]:
+                print("Returning to main menu...")
                 return
-            print(f"  Countdown: {i}...")
-            time.sleep(1.0)
+
+            low_sel = sel_raw.lower()
+            if low_sel == "c":
+                new_printer, config = _select_validated_physical_printer(
+                    config, initial_printer=target_printer, force_prompt=True
+                )
+                if new_printer:
+                    target_printer = new_printer
+                    is_fallback = False
+                continue
+
+            if low_sel == "r":
+                confirm_r = input(
+                    " [!] Archive and reset the ENTIRE global print tracker for all folders? (y/N): "
+                ).strip().lower()
+                if confirm_r in ["y", "yes"]:
+                    try:
+                        printer_manager.reset_printed_tracker_safe(tracker_file)
+                    except Exception as e:
+                        print(f" [!] Tracker reset aborted: {e}")
+                else:
+                    print(" [i] Tracker reset cancelled.")
+                continue
+
+            selected_folders = []
+            if low_sel in ["a", "all"]:
+                selected_folders = list(folders)
+                scope_label = f"All Folders ({len(folders)} folder(s))"
+            else:
+                tokens = [t.strip() for t in re.split(r"[\s,]+", sel_raw) if t.strip()]
+                seen_indices = set()
+                invalid_token = False
+                for tok in tokens:
+                    if not tok.isdigit():
+                        invalid_token = True
+                        break
+                    f_idx = int(tok)
+                    if f_idx < 1 or f_idx > len(folders):
+                        invalid_token = True
+                        break
+                    if f_idx not in seen_indices:
+                        seen_indices.add(f_idx)
+                        selected_folders.append(folders[f_idx - 1])
+
+                if invalid_token or not selected_folders:
+                    print(
+                        f"\n[!] Invalid selection '{sel_raw}'. Please enter folder number(s) between 1 and {len(folders)}, 'A', 'R', 'C', or 'Q'."
+                    )
+                    continue
+
+                if len(selected_folders) == 1:
+                    scope_label = selected_folders[0]["name"]
+                else:
+                    scope_label = ", ".join(f["name"] for f in selected_folders)
+
+            # Aggregate PDFs for the selected folder(s)
+            all_selected_jobs = []
+            pending_jobs = []
+            already_printed_count = 0
+
+            for f_info in selected_folders:
+                already_printed_count += f_info["printed"]
+                pending_jobs.extend(f_info["pending"])
+                for p_path in f_info["pdf_files"]:
+                    base_name = os.path.splitext(os.path.basename(p_path))[0]
+                    all_selected_jobs.append((base_name, p_path, f_info["name"]))
+
+            p_cat = printer_manager.classify_printer(target_printer)
+            fallback_str = " (Auto-Detected)" if is_fallback else ""
+            print("\n" + "=" * 65)
+            print(f"        SELECTED BATCH SUMMARY: {scope_label}")
+            print("=" * 65)
+            print(f" Target Printer   : {target_printer} [{p_cat}]{fallback_str}")
+            print(f" Selected Folder  : {scope_label}")
+            print(f" Total PDFs Found : {len(all_selected_jobs)}")
+            print(f" Already Printed  : {already_printed_count}")
+            print(f" Pending to Print : {len(pending_jobs)}")
+            print(f" Spooler Window   : {max_queue} active jobs")
+            print("=" * 65)
+
+            # Scoped action prompt when previously printed documents exist in selection
+            if already_printed_count > 0 and pending_jobs:
+                print(
+                    f"\n [i] Notice: {already_printed_count} of {len(all_selected_jobs)} document(s) in '{scope_label}' were previously printed."
+                )
+                print(
+                    " Options: [Enter] Print pending only | [A] Force re-print all in selection | [C] Change printer | [B] Back to folder list"
+                )
+                act = input(" Select action ([Enter] / A / C / B): ").strip().lower()
+                if act == "b":
+                    continue
+                elif act == "c":
+                    new_printer, config = _select_validated_physical_printer(
+                        config, initial_printer=target_printer, force_prompt=True
+                    )
+                    if not new_printer:
+                        print("[!] Printer change cancelled.")
+                        continue
+                    target_printer = new_printer
+                    is_fallback = False
+                elif act == "a":
+                    pending_jobs = list(all_selected_jobs)
+                    print(f" [*] Queuing all {len(pending_jobs)} documents in '{scope_label}' for re-printing...")
+            elif not pending_jobs:
+                print(f"\n[✓] All PDFs in '{scope_label}' have already been printed according to tracker!")
+                print(
+                    " Options: [A] Force re-print all in selection | [C] Change printer | [Enter]/[B] Back to folder list"
+                )
+                reprint_ans = input(" Select action (A / C / [Enter]): ").strip().lower()
+                if reprint_ans == "a":
+                    pending_jobs = list(all_selected_jobs)
+                    print(f" [*] Queuing all {len(pending_jobs)} documents in '{scope_label}' for re-printing...")
+                elif reprint_ans == "c":
+                    new_printer, config = _select_validated_physical_printer(
+                        config, initial_printer=target_printer, force_prompt=True
+                    )
+                    if new_printer:
+                        target_printer = new_printer
+                        is_fallback = False
+                    continue
+                else:
+                    continue
+
+            confirm = input(
+                f"\nProceed with printing {len(pending_jobs)} document(s) from '{scope_label}' to '{target_printer}'? (Y/n) [C=Printer, B=Back]: "
+            ).strip().lower()
+            if confirm == "b":
+                continue
+            if confirm == "c":
+                new_printer, config = _select_validated_physical_printer(
+                    config, initial_printer=target_printer, force_prompt=True
+                )
+                if not new_printer:
+                    print(" [!] Printer selection cancelled.")
+                    continue
+                target_printer = new_printer
+                is_fallback = False
+                confirm = input(
+                    f"Proceed with printing {len(pending_jobs)} document(s) to '{target_printer}'? (Y/n) [Default: Y]: "
+                ).strip().lower()
+
+            if confirm not in ["", "y", "yes"]:
+                print(" [i] Batch printing cancelled for current selection. Returning to folder menu...")
+                continue
+
+            print("\n[*] Starting batch printing in 3 seconds! Press [ESC] at any time to abort...")
+            countdown_aborted = False
+            for i in range(3, 0, -1):
+                if engine.check_abort():
+                    print("\n[!] Aborted during countdown.")
+                    countdown_aborted = True
+                    break
+                print(f"  Countdown: {i}...")
+                time.sleep(1.0)
+
+            if countdown_aborted:
+                continue
+
+            stats = {
+                "total": len(pending_jobs),
+                "printed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "aborted": False,
+            }
+            in_flight = []
+
+            def _on_poll_reconcile(spool_status):
+                c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                    target_printer, in_flight, tracker_file, status=spool_status
+                )
+                stats["printed"] += c_done
+                stats["failed"] += len(f_done)
+
+            for idx, (c_num, p_path, f_name) in enumerate(pending_jobs, 1):
+                if engine.check_abort():
+                    print("\n[!] Batch printing stopped by user (Esc pressed).")
+                    stats["aborted"] = True
+                    break
+
+                # Opportunistically reconcile any in-flight jobs that finished before this iteration
+                try:
+                    c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                        target_printer, in_flight, tracker_file
+                    )
+                    stats["printed"] += c_done
+                    stats["failed"] += len(f_done)
+                except Exception as rec_err:
+                    print(f"  [!] Tracker error while reconciling in-flight jobs: {rec_err}")
+                    stats["aborted"] = True
+                    break
+
+                print(
+                    f"\n[->] [{idx}/{len(pending_jobs)}] Printing: {os.path.basename(p_path)} "
+                    f"(Complaint #{c_num} | Folder: {f_name})"
+                )
+
+                # Sliding-Window Spooler Queue Gate: keeps up to max_queue jobs buffered
+                try:
+                    gate_ok = printer_manager.enforce_queue_gate(
+                        target_printer,
+                        max_jobs=max_queue,
+                        on_poll=_on_poll_reconcile,
+                        check_abort_fn=engine.check_abort,
+                    )
+                except KeyboardInterrupt:
+                    stats["aborted"] = True
+                    break
+                except Exception as gate_err:
+                    print(f"  [!] Error during queue gate reconciliation: {gate_err}")
+                    stats["aborted"] = True
+                    break
+
+                if not gate_ok:
+                    print(f"  [i] Skipped Complaint #{c_num} by user request.")
+                    stats["skipped"] += 1
+                    continue
+
+                try:
+                    doc_name = f"Complaint_{c_num}.pdf"
+                    job_id = printer_manager.print_pdf_silent(p_path, target_printer, doc_name=doc_name)
+                    if not job_id:
+                        raise RuntimeError("Silent print did not return a valid spool job.")
+                    printer_manager.mark_complaint_spooled(
+                        tracker_file, c_num, p_path, target_printer, job_id=job_id
+                    )
+                    in_flight.append(
+                        {
+                            "complaint_no": c_num,
+                            "file_path": p_path,
+                            "job_id": job_id,
+                            "doc_name": doc_name,
+                        }
+                    )
+                    print(
+                        f"  [*] Complaint #{c_num} spooled to {target_printer} "
+                        f"(Sliding window: {len(in_flight)}/{max_queue} active)."
+                    )
+                    time.sleep(0.25)  # Micro-throttle between spool dispatches
+                except KeyboardInterrupt:
+                    print("\n[!] Batch printing interrupted by user (Ctrl+C).")
+                    stats["aborted"] = True
+                    break
+                except Exception as e:
+                    print(f"  [!] Failed to spool {os.path.basename(p_path)}: {e}")
+                    stats["failed"] += 1
+
+            # Final Drain Pass: reconcile all remaining spooled jobs in the sliding window
+            if in_flight and not stats["aborted"]:
+                try:
+                    c_drained, f_drained, drain_aborted = printer_manager.drain_in_flight_jobs(
+                        target_printer,
+                        in_flight,
+                        tracker_file,
+                        check_abort_fn=engine.check_abort,
+                    )
+                    stats["printed"] += c_drained
+                    stats["failed"] += len(f_drained)
+                    if drain_aborted:
+                        stats["aborted"] = True
+                except KeyboardInterrupt:
+                    print("\n[!] Final spooler drain interrupted by user.")
+                    stats["aborted"] = True
+                except Exception as drain_err:
+                    print(f"\n[!] Error during final spooler drain: {drain_err}")
+                    stats["failed"] += len(in_flight)
+                    in_flight.clear()
+
+            print("\n" + "=" * 55)
+            print(f"        BATCH PRINTING SUMMARY ({scope_label})")
+            print("=" * 55)
+            print(f" Total Queued:         {stats['total']}")
+            print(f" Confirmed Printed:    {stats['printed']}")
+            print(f" Skipped:              {stats['skipped']}")
+            print(f" Failed:               {stats['failed']}")
+            print(f" Interrupted:          {stats['aborted']}")
+            print("=" * 55)
     except KeyboardInterrupt:
         print("\n[!] Batch printing cancelled by user (Ctrl+C).")
         return
-
-    stats = {
-        "total": len(pending_jobs),
-        "printed": 0,
-        "skipped": 0,
-        "failed": 0,
-        "aborted": False
-    }
-
-    for idx, (c_num, p_path) in enumerate(pending_jobs, 1):
-        if engine.check_abort():
-            print("\n[!] Batch printing stopped by user (Esc pressed).")
-            stats["aborted"] = True
-            break
-
-        print(f"\n[->] [{idx}/{len(pending_jobs)}] Printing: {os.path.basename(p_path)} (Complaint #{c_num})")
-
-        # Hardware failsafe check: queue gate
-        try:
-            gate_ok = printer_manager.enforce_queue_gate(target_printer, max_jobs=max_queue)
-        except KeyboardInterrupt:
-            stats["aborted"] = True
-            break
-
-        if not gate_ok:
-            print(f"  [i] Skipped Complaint #{c_num} by user request.")
-            stats["skipped"] += 1
-            continue
-
-        try:
-            doc_name = f"Complaint_{c_num}.pdf"
-            job_id = printer_manager.print_pdf_silent(p_path, target_printer, doc_name=doc_name)
-            if not job_id:
-                raise RuntimeError("Silent print did not return a valid spool job.")
-            printer_manager.mark_complaint_spooled(
-                tracker_file, c_num, p_path, target_printer, job_id=job_id
-            )
-            print(f"  [*] Complaint #{c_num} spooled to {target_printer}. Verifying print completion...")
-            confirmed, status_msg = printer_manager.reconcile_print_job(
-                target_printer, job_id=job_id, doc_name=doc_name
-            )
-            if not confirmed:
-                raise RuntimeError(f"Print job not confirmed ({status_msg}); kept eligible for retry.")
-            if not printer_manager.mark_complaint_printed(
-                tracker_file, c_num, p_path, target_printer, job_id=job_id
-            ):
-                raise RuntimeError(f"Failed to record confirmed print in '{tracker_file}'.")
-            stats["printed"] += 1
-            print(f"  [✓] Complaint #{c_num} confirmed printed on {target_printer}.")
-            time.sleep(0.5)  # Micro-throttle between spool jobs
-        except KeyboardInterrupt:
-            print("\n[!] Batch printing interrupted by user (Ctrl+C).")
-            stats["aborted"] = True
-            break
-        except Exception as e:
-            print(f"  [!] Failed to print {os.path.basename(p_path)}: {e}")
-            stats["failed"] += 1
-
-    print("\n" + "=" * 50)
-    print("        BATCH PRINTING SUMMARY")
-    print("=" * 50)
-    print(f" Total Queued:         {stats['total']}")
-    print(f" Confirmed Printed:    {stats['printed']}")
-    print(f" Skipped:              {stats['skipped']}")
-    print(f" Failed:               {stats['failed']}")
-    print(f" Interrupted:          {stats['aborted']}")
-    print("=" * 50 + "\n")
 
 
 def main():
