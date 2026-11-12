@@ -40,6 +40,151 @@ def get_installed_printers() -> List[str]:
     return [p[2] for p in printers]
 
 
+def classify_printer(printer_name: str) -> str:
+    """
+    Determines whether a printer is PHYSICAL or VIRTUAL (PDF/XPS/Fax/OneNote/Evernote/Writer).
+    Inspects printer name, port, and driver metadata.
+    Returns:
+        'PHYSICAL' or 'VIRTUAL'
+    """
+    if not win32print or not printer_name:
+        return "UNKNOWN"
+
+    name_lower = printer_name.lower()
+    virtual_keywords = ["pdf", "xps", "fax", "onenote", "evernote", "document writer", "root print queue"]
+    for kw in virtual_keywords:
+        if kw in name_lower:
+            return "VIRTUAL"
+
+    try:
+        h_printer = win32print.OpenPrinter(printer_name)
+        try:
+            info = win32print.GetPrinter(h_printer, 2)
+            port = str(info.get("pPortName", "")).lower()
+            driver = str(info.get("pDriverName", "")).lower()
+
+            for kw in virtual_keywords:
+                if kw in driver:
+                    return "VIRTUAL"
+
+            virtual_ports = ["portprompt:", "shrfax:", "file:", "nul:", "foxit_"]
+            for vp in virtual_ports:
+                if vp in port:
+                    return "VIRTUAL"
+        finally:
+            win32print.ClosePrinter(h_printer)
+    except Exception:
+        pass
+
+    return "PHYSICAL"
+
+
+def select_printer_interactive(
+    config: Optional[Dict] = None,
+    auto_save: bool = True,
+    force_prompt: bool = False,
+    header_title: str = "SILENT PRINTER SELECTION"
+) -> Tuple[Optional[str], Optional[Dict]]:
+    """
+    Unified interactive printer selection interface.
+    Enumerates installed printers, categorizes them as PHYSICAL or VIRTUAL,
+    displays a simplified numbered list with status badges, and saves to config.json.
+
+    Args:
+        config: Current configuration dictionary. Loaded automatically if None.
+        auto_save: If True, immediately writes selection to config.json.
+        force_prompt: If True, always presents menu even if printer already configured.
+        header_title: Custom header title for context.
+
+    Returns:
+        Tuple of (selected_printer_name, config_dict).
+    """
+    import config_manager
+
+    if config is None:
+        config = config_manager.load_config() or config_manager.DEFAULT_CONFIG.copy()
+
+    printers = get_installed_printers()
+    default_printer = get_default_printer()
+    current_printer = config.get("printing", {}).get("printer_name")
+
+    if not printers:
+        print("\n [!] ERROR: No Windows printers detected on this computer.")
+        return None, config
+
+    # Check if existing printer is valid and prompt is not forced
+    current_is_virtual = classify_printer(current_printer) == "VIRTUAL" if current_printer else False
+    if not force_prompt and current_printer and current_printer in printers and not current_is_virtual:
+        return current_printer, config
+
+    # Header display
+    curr_badge = f" [{classify_printer(current_printer)}]" if current_printer else ""
+    def_badge = f" [{classify_printer(default_printer)}]" if default_printer else ""
+
+    print("\n" + "=" * 65)
+    print(f"        {header_title.upper()}")
+    print("=" * 65)
+    print(f" Current Configured Target : {current_printer or '(None)'}{curr_badge}")
+    print(f" Windows OS Default Printer: {default_printer or 'None'}{def_badge}")
+    print("-" * 65)
+    print(" Installed Windows Printers:")
+
+    for idx, p_name in enumerate(printers, start=1):
+        cat = classify_printer(p_name)
+        tags = [cat]
+        if p_name == default_printer:
+            tags.append("DEFAULT")
+        if p_name == current_printer:
+            tags.append("SELECTED")
+        tag_str = f" [{', '.join(tags)}]"
+        print(f"   [{idx}] {p_name}{tag_str}")
+
+    print("=" * 65)
+
+    prompt_label = f" Select printer [1-{len(printers)}]"
+    if current_printer:
+        prompt_label += " (or press Enter to keep current): "
+    else:
+        prompt_label += ": "
+
+    choice = input(prompt_label).strip()
+    selected_name = current_printer
+
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(printers):
+            selected_name = printers[idx - 1]
+            cat = classify_printer(selected_name)
+            print(f" [✓] Selected: {selected_name} [{cat}]")
+            if cat == "VIRTUAL":
+                print(" [!] Notice: You selected a VIRTUAL printer. It may open file dialogs instead of physical printing.")
+        else:
+            print(" [!] Invalid selection index. Keeping existing printer setting.")
+    elif current_printer:
+        print(f" [i] Keeping configured printer: {current_printer}")
+    else:
+        # Default fallback to first physical printer, or system default
+        physical_candidates = [p for p in printers if classify_printer(p) == "PHYSICAL"]
+        if physical_candidates:
+            selected_name = physical_candidates[0]
+            print(f" [i] Automatically selected first physical printer: {selected_name}")
+        elif default_printer:
+            selected_name = default_printer
+            print(f" [i] Defaulting to system printer: {selected_name}")
+        else:
+            selected_name = printers[0]
+
+    # Save to config if requested
+    if auto_save and selected_name:
+        if "printing" not in config:
+            config["printing"] = {}
+        config["printing"]["printer_name"] = selected_name
+        config_manager.save_config(config)
+        print(f" [✓] Saved target printer '{selected_name}' to config.json.")
+
+    return selected_name, config
+
+
 def get_default_printer() -> Optional[str]:
     """
     Retrieves the system default printer configured in Windows.
@@ -147,13 +292,18 @@ def get_queue_status(printer_name: str) -> Dict:
 def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
     """
     Hardware Failsafe Pre-Dispatch Gate.
-    Monitors the Windows Print Spooler. If queue >= max_jobs or a hardware error is detected,
-    pauses execution, emits audio beeps, and prompts the user until resolved.
+    Monitors the Windows Print Spooler.
+    If queue >= max_jobs and no hardware error, quietly auto-drains up to 15 seconds.
+    If queue remains saturated or a hardware error is detected, pauses execution,
+    emits audio beeps, and prompts the operator with options including Force Print [F].
 
     Returns:
-        True: Queue is healthy, safe to dispatch print job.
+        True: Queue is healthy or operator forced dispatch.
         False: Operator elected to skip this print job.
     """
+    drain_timeout = 15.0
+    drain_start = None
+
     while True:
         status = get_queue_status(printer_name)
         job_count = status.get("job_count", 0)
@@ -163,6 +313,18 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         # Queue is healthy if jobs < max_jobs and no hardware error
         if job_count < max_jobs and not has_error:
             return True
+
+        # Smart Auto-Drain Wait: If queue is saturated but NO hardware error, wait quietly up to 15s
+        if not has_error and job_count >= max_jobs:
+            if drain_start is None:
+                drain_start = time.time()
+                print(f" [i] Spooler queue has {job_count}/{max_jobs} active jobs. Waiting up to 15s for printer to drain...")
+
+            elapsed = time.time() - drain_start
+            if elapsed < drain_timeout:
+                time.sleep(1.5)
+                continue
+            # If elapsed >= drain_timeout, fall through to audible alert prompt
 
         # Audible warning (2 alert beeps)
         try:
@@ -186,18 +348,24 @@ def enforce_queue_gate(printer_name: str, max_jobs: int = 3) -> bool:
         print("  - Printer turned off or offline")
         print("=" * 65)
         print(" [Enter] Re-check queue and resume once hardware is cleared")
+        print(" [F]     Force Print (Bypass/ignore warning and send job anyway)")
         print(" [S]     Skip printing this complaint (mark unprinted)")
         print(" [Q]     Abort entire batch operation")
         print("=" * 65)
 
-        user_choice = input(" Select action ([Enter] / S / Q): ").strip().lower()
-        if user_choice == "s":
+        user_choice = input(" Select action ([Enter] / F / S / Q): ").strip().lower()
+        if user_choice == "f":
+            print(" [!] Operator override: Forcing print job dispatch despite warning.")
+            return True
+        elif user_choice == "s":
             print(" [i] Skipping print for this complaint.")
             return False
         elif user_choice == "q":
             print(" [!] Batch operation aborted by operator.")
             raise KeyboardInterrupt("Print queue operation aborted by user.")
 
+        # Reset drain timer for next check
+        drain_start = None
         print(" [i] Re-checking printer status...")
         time.sleep(1.0)
 
@@ -335,3 +503,45 @@ def mark_complaint_printed(
             os.fsync(f.fileno())
     except Exception as e:
         print(f" [!] Warning: Failed to write to {tracker_path}: {e}")
+
+
+def reset_printed_tracker_safe(tracker_path: str = "printed_complaints.txt") -> Optional[str]:
+    """
+    Safely archives the existing printed_complaints.txt to a timestamped backup (.bak)
+    and initializes a clean tracking file with header metadata.
+    Returns:
+        Backup file path if archived, or None.
+    """
+    import shutil
+
+    backup_path = None
+    if os.path.exists(tracker_path):
+        has_content = False
+        try:
+            with open(tracker_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and not line.strip().startswith("#"):
+                        has_content = True
+                        break
+        except Exception:
+            pass
+
+        if has_content:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_dir = os.path.dirname(os.path.abspath(tracker_path))
+            backup_name = f"printed_complaints_{ts}.bak"
+            backup_path = os.path.join(base_dir, backup_name)
+            try:
+                shutil.copy2(tracker_path, backup_path)
+                print(f" [✓] Previous print tracker archived to: {backup_name}")
+            except Exception as e:
+                print(f" [!] Warning: Failed to create archive backup: {e}")
+
+    try:
+        with open(tracker_path, "w", encoding="utf-8") as f:
+            f.write("# COMPLAINT_NO | TIMESTAMP | PRINTER | FILE\n")
+        print(f" [✓] Print tracker '{os.path.basename(tracker_path)}' reset to clean state.")
+    except Exception as e:
+        print(f" [!] Error resetting tracker file {tracker_path}: {e}")
+
+    return backup_path

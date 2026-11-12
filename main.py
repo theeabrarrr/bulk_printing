@@ -119,10 +119,16 @@ def run_bulk_mode(config):
 
     # Prompt user for Live Printing preference
     configured_printer, is_fallback = config_manager.get_configured_printer(config)
-    fallback_hint = " [Dynamic OS Default]" if is_fallback else ""
-    printer_label = configured_printer or "None (PDF only)"
+    fallback_hint = " (Auto-Detected)" if is_fallback else ""
+    p_cat = f" [{printer_manager.classify_printer(configured_printer)}]" if configured_printer else ""
+    printer_label = f"{configured_printer}{p_cat}{fallback_hint}" if configured_printer else "None (PDF only)"
 
-    live_choice = input(f"\n[->] Enable Live Physical Printing to '{printer_label}'{fallback_hint}? (y/N) [Default: N]: ").strip().lower()
+    live_choice = input(f"\n[->] Enable Live Physical Printing to '{printer_label}'? (y/N) [or C to change]: ").strip().lower()
+    if live_choice == "c":
+        configured_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+        if configured_printer:
+            live_choice = input(f"    Enable Live Physical Printing to '{configured_printer}'? (y/N) [Default: N]: ").strip().lower()
+
     if live_choice in ["y", "yes"]:
         if not configured_printer:
             print("    [!] Warning: No physical printer detected. Live printing disabled.")
@@ -175,10 +181,16 @@ def run_manual_mode(config):
 
     # Prompt user for Live Printing preference
     configured_printer, is_fallback = config_manager.get_configured_printer(config)
-    fallback_hint = " [Dynamic OS Default]" if is_fallback else ""
-    printer_label = configured_printer or "None (PDF only)"
+    fallback_hint = " (Auto-Detected)" if is_fallback else ""
+    p_cat = f" [{printer_manager.classify_printer(configured_printer)}]" if configured_printer else ""
+    printer_label = f"{configured_printer}{p_cat}{fallback_hint}" if configured_printer else "None (PDF only)"
 
-    live_choice = input(f"  Enable Live Physical Printing to '{printer_label}'{fallback_hint}? (y/N) [Default: N]: ").strip().lower()
+    live_choice = input(f"  Enable Live Physical Printing to '{printer_label}'? (y/N) [or C to change]: ").strip().lower()
+    if live_choice == "c":
+        configured_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+        if configured_printer:
+            live_choice = input(f"  Enable Live Physical Printing to '{configured_printer}'? (y/N) [Default: N]: ").strip().lower()
+
     live_print = (live_choice in ["y", "yes"]) and bool(configured_printer)
     if live_print:
         print(f"  [+] Live physical printing enabled for '{configured_printer}'.")
@@ -304,9 +316,14 @@ def run_batch_print_mode(config):
     printing_settings = config_manager.get_printing_settings(config)
     target_printer, is_fallback = config_manager.get_configured_printer(config)
 
-    if not target_printer:
-        print("\n[!] ERROR: No Windows printer available. Please connect a printer or configure one in the Setup Wizard.")
-        return
+    # Check target printer; if unset or virtual, auto-prompt selection
+    if not target_printer or printer_manager.classify_printer(target_printer) == "VIRTUAL":
+        print("\n[!] Notice: Target printer is unset or virtual. Please select a physical printer:")
+        target_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+        if not target_printer:
+            print("[!] Batch printing cancelled: No printer selected.")
+            return
+        is_fallback = False
 
     output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
     tracker_file = config_manager.resolve_path(printing_settings.get("printed_tracker_file", "printed_complaints.txt"))
@@ -340,11 +357,12 @@ def run_batch_print_mode(config):
         else:
             pending_jobs.append((base_name, p_path))
 
-    fallback_str = " (Dynamic OS Default)" if is_fallback else ""
+    p_cat = printer_manager.classify_printer(target_printer)
+    fallback_str = " (Auto-Detected)" if is_fallback else ""
     print("\n" + "=" * 60)
     print("        OFFLINE BATCH PRINTING (Today_Complaints)")
     print("=" * 60)
-    print(f" Target Printer   : {target_printer}{fallback_str}")
+    print(f" Target Printer   : {target_printer} [{p_cat}]{fallback_str}")
     print(f" Directory Scanned: {output_dir}")
     print(f" Total PDFs Found : {len(pdf_files)}")
     print(f" Already Printed  : {already_printed_count}")
@@ -352,17 +370,49 @@ def run_batch_print_mode(config):
     print(f" Spooler Threshold: {max_queue} active jobs")
     print("=" * 60)
 
-    if not pending_jobs:
-        print("\n[✓] All PDFs in 'Today_Complaints' have already been printed according to tracker!")
-        reprint_ans = input(" Would you like to force re-print all documents? (y/N) [Default: N]: ").strip().lower()
-        if reprint_ans in ["y", "yes"]:
+    # Smart prompt when previously printed documents exist
+    if already_printed_count > 0 and pending_jobs:
+        print(f"\n [i] Notice: {already_printed_count} of {len(pdf_files)} document(s) were previously printed.")
+        print(" Options: [Enter] Print pending only | [A] Force re-print all | [R] Reset print tracker | [C] Change printer")
+        act = input(" Select action ([Enter] / A / R / C): ").strip().lower()
+        if act == "c":
+            target_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+            if not target_printer:
+                return
+        elif act == "a":
             pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
             print(f" [*] Queuing all {len(pending_jobs)} documents for re-printing...")
+        elif act == "r":
+            printer_manager.reset_printed_tracker_safe(tracker_file)
+            pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
+            print(f" [*] Print tracker reset! All {len(pending_jobs)} documents will be printed.")
+    elif not pending_jobs:
+        print("\n[✓] All PDFs in 'Today_Complaints' have already been printed according to tracker!")
+        print(" Options: [A] Force re-print all | [R] Reset print tracker | [C] Change printer | [Enter] Return to menu")
+        reprint_ans = input(" Select action (A / R / C / [Enter]): ").strip().lower()
+        if reprint_ans == "a":
+            pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
+            print(f" [*] Queuing all {len(pending_jobs)} documents for re-printing...")
+        elif reprint_ans == "r":
+            printer_manager.reset_printed_tracker_safe(tracker_file)
+            pending_jobs = [(os.path.splitext(os.path.basename(p))[0], p) for p in sorted(pdf_files)]
+            print(f" [*] Print tracker reset! All {len(pending_jobs)} documents queued for printing...")
+        elif reprint_ans == "c":
+            target_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+            if not target_printer:
+                return
+            return run_batch_print_mode(config)
         else:
             print(" Returning to main menu.")
             return
 
-    confirm = input(f"\nProceed with printing {len(pending_jobs)} document(s)? (Y/n) [Default: Y]: ").strip().lower()
+    confirm = input(f"\nProceed with printing {len(pending_jobs)} document(s) to '{target_printer}'? (Y/n) [or C to change]: ").strip().lower()
+    if confirm == "c":
+        target_printer, config = printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+        if not target_printer:
+            return
+        confirm = input(f"Proceed with printing to '{target_printer}'? (Y/n) [Default: Y]: ").strip().lower()
+
     if confirm not in ["", "y", "yes"]:
         print(" [!] Batch printing cancelled by operator.")
         return
@@ -477,18 +527,24 @@ def main():
             print(" Coordinates may not align with ERP buttons. Select [3] to recalibrate.")
             print("!" * 60)
 
-        print("\n" + "-" * 60)
+        configured_p, is_fb = config_manager.get_configured_printer(config)
+        p_badge = f" [{printer_manager.classify_printer(configured_p)}]" if configured_p else ""
+        fb_note = " (Auto-Detected)" if is_fb else ""
+
+        print("\n" + "=" * 60)
         print(" MAIN MENU")
-        print("-" * 60)
+        print(f" Target Printer: {configured_p or 'None'}{p_badge}{fb_note}")
+        print("=" * 60)
         print("  [1] Bulk Mode (Process complaints.xlsx)")
         print("  [2] Manual Mode (Process single/batch complaint #s)")
-        print("  [3] Recalibrate Coordinates & Printer (Setup Wizard)")
+        print("  [3] Recalibrate Coordinates (Setup Wizard)")
         print("  [4] Generate OTP (Interactive Mode)")
         print("  [5] Batch Print Offline PDFs (Today_Complaints)")
-        print("  [6] Exit")
-        print("-" * 60)
+        print("  [6] Select / Change Target Printer")
+        print("  [7] Exit")
+        print("=" * 60)
 
-        choice = input("Select an option [1-6]: ").strip()
+        choice = input("Select an option [1-7]: ").strip()
 
         if choice == "1":
             run_bulk_mode(config)
@@ -500,11 +556,13 @@ def main():
             run_otp_mode(config)
         elif choice == "5":
             run_batch_print_mode(config)
-        elif choice == "6" or choice.lower() in ["exit", "q", "quit"]:
+        elif choice == "6":
+            printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
+        elif choice == "7" or choice.lower() in ["exit", "q", "quit"]:
             print("\nExiting ERP Automation Suite. Goodbye!")
             break
         else:
-            print("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.")
+            print("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, 6, or 7.")
 
 
 if __name__ == "__main__":

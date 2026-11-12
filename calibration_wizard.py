@@ -111,54 +111,20 @@ def replay_cursor_verification(coords, targets=None):
 
 def configure_printer_menu(cfg=None):
     """
-    Interactive workflow to detect, select, and configure the target Windows printer
-    and spooler queue thresholds.
+    Sub-menu [4]: Configure Physical Printer & Spooler.
+    Delegates to printer_manager.select_printer_interactive and allows configuring
+    spooler queue thresholds and testing device responsiveness.
     """
     import printer_manager as pm
 
     if cfg is None:
         cfg = config_manager.load_config() or config_manager.DEFAULT_CONFIG.copy()
 
-    printers = pm.get_installed_printers()
-    default_printer = pm.get_default_printer()
-    current_printer = cfg.get("printing", {}).get("printer_name")
+    selected_name, cfg = pm.select_printer_interactive(
+        config=cfg, auto_save=False, force_prompt=True, header_title="CONFIGURE PHYSICAL PRINTER & SPOOLER"
+    )
+
     current_max_queue = cfg.get("printing", {}).get("max_spool_queue", 3)
-
-    print("\n" + "=" * 60)
-    print("      SILENT PRINTER & SPOOLER CONFIGURATION")
-    print("=" * 60)
-    print(f"Windows Default Printer  : {default_printer or 'None detected'}")
-    print(f"Current Configured Target: {current_printer or '(Dynamic OS Default)'}")
-    print(f"Current Queue Threshold  : {current_max_queue} pending jobs")
-    print("-" * 60)
-    print("Installed Windows Printers:")
-    for idx, p_name in enumerate(printers, start=1):
-        tags = []
-        if p_name == default_printer:
-            tags.append("DEFAULT")
-        if p_name == current_printer:
-            tags.append("SELECTED")
-        tag_str = f" [{', '.join(tags)}]" if tags else ""
-        print(f"  [{idx}] {p_name}{tag_str}")
-
-    print("  [0] Dynamic OS Default (auto-detect system default)")
-    print("=" * 60)
-
-    choice = input(f"\nSelect printer [0-{len(printers)}] (or press Enter to keep current): ").strip()
-    selected_name = current_printer
-
-    if choice == "0":
-        selected_name = None
-        print(f" [✓] Set target printer to Dynamic OS Default ({default_printer}).")
-    elif choice.isdigit():
-        idx = int(choice)
-        if 1 <= idx <= len(printers):
-            selected_name = printers[idx - 1]
-            print(f" [✓] Selected target printer: {selected_name}")
-        else:
-            print(" [!] Invalid index. Keeping existing printer setting.")
-    else:
-        print(" [i] Keeping current printer setting.")
 
     # Queue threshold configuration
     q_input = input(f"\nEnter max spooler queue jobs before hardware alert [default: {current_max_queue}]: ").strip()
@@ -169,7 +135,7 @@ def configure_printer_menu(cfg=None):
 
     # Optional test print / connectivity verification
     print("\n" + "-" * 60)
-    target_to_test = selected_name or default_printer
+    target_to_test = selected_name or pm.get_default_printer()
     if target_to_test:
         test_ans = input(f"Would you like to test spooler connectivity for '{target_to_test}'? [y/N]: ").strip().lower()
         if test_ans in ["y", "yes"]:

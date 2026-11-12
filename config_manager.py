@@ -210,7 +210,8 @@ def get_configured_printer(config=None):
     """
     Resolves the target printer name.
     1. Returns config["printing"]["printer_name"] if specified and installed.
-    2. Falls back to the Windows system default printer if not configured or disconnected.
+    2. If unconfigured or disconnected, prioritizes physical/hardware printers first.
+    3. Falls back to the Windows system default printer if no physical printer is found.
     Returns:
         (printer_name: str or None, is_fallback: bool)
     """
@@ -222,6 +223,11 @@ def get_configured_printer(config=None):
 
     if configured and configured in installed:
         return configured, False
+
+    # Prefer physical hardware printers over virtual software printers
+    physical_printers = [p for p in installed if pm.classify_printer(p) == "PHYSICAL"]
+    if physical_printers:
+        return physical_printers[0], True
 
     # Fallback to system default
     default_p = pm.get_default_printer()
