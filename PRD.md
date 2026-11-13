@@ -13,7 +13,7 @@ To maintain full system stability and traceability across development and deploy
    - Every completed step and code modification strictly requires an immediate Git commit with a clear, descriptive, standardized commit message following Conventional Commits format (`feat(...)`, `fix(...)`, `docs(...)`, etc.).
    - No untracked or undocumented changes are permitted.
 2. **No Unprompted Refactoring**:
-   - Working code from previous phases (e.g., `masterbot.py`, verified delay timings, and GUI interaction sequences) must NEVER be modified, rewritten, or refactored unless explicitly instructed by the user.
+   - Working code from previous phases (e.g., `legacy/masterbot.py`, verified delay timings, and GUI interaction sequences) must NEVER be modified, rewritten, or refactored unless explicitly instructed by the user.
 3. **Strict PRD & Step-by-Step Plan Alignment**:
    - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Execution Plan.
 

@@ -39,7 +39,7 @@
     "database_file": "complaints_state.db"
   },
   "printing": {
-    "printer_name": null,
+    "printer_name": "HP LaserJet 400 M401 PCL 6 (Copy 1)",
     "max_spool_queue": 3,
     "enable_live_print": false,
     "printed_tracker_file": "printed_complaints.txt"

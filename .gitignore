@@ -7,7 +7,12 @@ dist/
 Test_Output/
 Today_Complaints/
 logs/
+*.log
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
 *.bak
+completed_complaints.txt
+printed_complaints.txt

@@ -124,12 +124,62 @@ def _restore_runtime_data(backup_dir, suite_dir, preserved_items):
             print(f"  [*] Preserved existing runtime data: {dst}")
 
 
+def _terminate_running_suite_processes(suite_dir=None):
+    """Terminates any running ERP_Automation_Suite.exe processes and evacuates locked DLLs so PyInstaller can rebuild cleanly."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", f"{EXE_NAME}.exe", "/T"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    if suite_dir and os.path.exists(suite_dir):
+        for target in (os.path.join(suite_dir, f"{EXE_NAME}.exe"), os.path.join(suite_dir, "_internal")):
+            if not os.path.exists(target):
+                continue
+            if os.path.isfile(target):
+                try:
+                    os.remove(target)
+                except PermissionError:
+                    try:
+                        shutil.move(target, tempfile.mktemp(prefix="old_exe_"))
+                    except Exception:
+                        pass
+            else:
+                for root, dirs, files in os.walk(target, topdown=False):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            os.remove(fp)
+                        except PermissionError:
+                            try:
+                                shutil.move(fp, tempfile.mktemp(prefix="old_dll_"))
+                            except Exception:
+                                pass
+                    for d in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, d))
+                        except OSError:
+                            pass
+                try:
+                    os.rmdir(target)
+                except OSError:
+                    pass
+
+
 def build_executable():
     """Runs PyInstaller to package main.py into a standalone --onedir suite."""
     print("=" * 60)
     print(f"  BUILDING ONEDIR SUITE: {PACKAGE_NAME} ({EXE_NAME}.exe)")
     print("=" * 60)
 
+    dist_root = os.path.join(PROJECT_DIR, "dist")
+    suite_dir = os.path.join(dist_root, PACKAGE_NAME)
+    _terminate_running_suite_processes(suite_dir)
     verify_frozen_path_anchoring()
 
     if not check_pyinstaller():
@@ -239,6 +289,28 @@ def build_executable():
         print(f"  Distribution Suite: {suite_dir}")
         print(f"  Executable Location: {exe_path}")
         print("=" * 60)
+
+        # Clean up temporary PyInstaller workpath (build/), .spec file, and any root logs/ created during build
+        try:
+            import logger_manager
+            logger_manager.close_logging_handlers()
+        except Exception:
+            pass
+
+        build_work_dir = os.path.join(PROJECT_DIR, "build")
+        spec_file = os.path.join(PROJECT_DIR, f"{PACKAGE_NAME}.spec")
+        root_logs_dir = os.path.join(PROJECT_DIR, "logs")
+        root_pycache_dir = os.path.join(PROJECT_DIR, "__pycache__")
+        try:
+            for d in (build_work_dir, root_logs_dir, root_pycache_dir):
+                if os.path.exists(d):
+                    shutil.rmtree(d, ignore_errors=True)
+            if os.path.exists(spec_file):
+                os.remove(spec_file)
+            print("  [+] Cleaned up temporary PyInstaller build/, .spec, and root cache artifacts.")
+        except Exception as cleanup_err:
+            print(f"  [!] Notice: Could not remove temporary build artifacts: {cleanup_err}")
+
         return True
 
     print(f"\n[!] Build completed but executable was not found at {exe_path}.")

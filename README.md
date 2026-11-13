@@ -91,4 +91,4 @@ This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automatio
 | `calibration_wizard.py` | Guided wizard for coordinate capture (Space/F8) and physical printer configuration. |
 | `engine.py` | Unified RPA loop for PDF generation, Live Print dispatch & focus restoration, and isolated `generate_otp()` sequence. |
 | `build.py` | PyInstaller build script compiling standalone `--onedir` distribution to `dist/ERP_Automation_Suite/`. |
-| `masterbot.py` | Original Phase 2 baseline script (preserved untouched). |
+| `legacy/masterbot.py` | Original Phase 2 baseline script (archived & preserved untouched). |
