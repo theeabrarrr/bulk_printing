@@ -2,6 +2,7 @@
 printer_manager.py
 Modular Print Manager for Universal Silent Printing & Windows Spooler Queue Monitoring.
 Uses in-process headless GDI rendering (pypdfium2 + win32ui) for zero-popup physical printing.
+Persists spooler & print job state via state_manager (SQLite complaints_state.db).
 """
 
 import gc
@@ -9,8 +10,7 @@ import os
 import sys
 import time
 import winsound
-from datetime import datetime
-from typing import List, Dict, Optional, Set, Tuple, Callable, Any
+from typing import List, Dict, Optional, Set, Tuple, Callable, Any, Union
 
 if sys.platform == "win32":
     try:
@@ -32,6 +32,11 @@ else:
     ImageWin = None
     pdfium = None
 
+import logger_manager
+import state_manager
+
+logger = logger_manager.get_logger("printer_manager")
+
 # Tracks whether the most recent enforce_queue_gate call required interactive operator input
 LAST_GATE_PROMPTED: bool = False
 # Tracks the most recent spooler job ID created by print_pdf_silent
@@ -51,7 +56,7 @@ def get_installed_printers() -> List[str]:
         printers = win32print.EnumPrinters(flags)
         return [p[2] for p in printers]
     except Exception as e:
-        print(f" [!] Warning: Failed to enumerate Windows printers: {e}")
+        logger.warning(f" [!] Warning: Failed to enumerate Windows printers: {e}")
         return []
 
 
@@ -124,7 +129,7 @@ def select_printer_interactive(
     current_printer = config.get("printing", {}).get("printer_name")
 
     if not printers:
-        print("\n [!] ERROR: No Windows printers detected on this computer.")
+        logger.error("\n [!] ERROR: No Windows printers detected on this computer.")
         return None, config
 
     # Check if existing printer is valid and prompt is not forced
@@ -164,7 +169,7 @@ def select_printer_interactive(
 
     choice = input(prompt_label).strip()
     if choice.lower() in ["q", "quit", "cancel"]:
-        print(" [i] Printer selection cancelled.")
+        logger.info(" [i] Printer selection cancelled.")
         return None, config
 
     selected_name = current_printer
@@ -174,22 +179,22 @@ def select_printer_interactive(
         if 1 <= idx <= len(printers):
             selected_name = printers[idx - 1]
             cat = classify_printer(selected_name)
-            print(f" [✓] Selected: {selected_name} [{cat}]")
+            logger.info(f" [✓] Selected: {selected_name} [{cat}]")
             if cat == "VIRTUAL":
-                print(" [!] Notice: You selected a VIRTUAL printer. It may open file dialogs instead of physical printing.")
+                logger.warning(" [!] Notice: You selected a VIRTUAL printer. It may open file dialogs instead of physical printing.")
         else:
-            print(" [!] Invalid selection index. Keeping existing printer setting.")
+            logger.warning(" [!] Invalid selection index. Keeping existing printer setting.")
     elif current_printer:
-        print(f" [i] Keeping configured printer: {current_printer}")
+        logger.info(f" [i] Keeping configured printer: {current_printer}")
     else:
         # Default fallback to first physical printer, or system default
         physical_candidates = [p for p in printers if classify_printer(p) == "PHYSICAL"]
         if physical_candidates:
             selected_name = physical_candidates[0]
-            print(f" [i] Automatically selected first physical printer: {selected_name}")
+            logger.info(f" [i] Automatically selected first physical printer: {selected_name}")
         elif default_printer:
             selected_name = default_printer
-            print(f" [i] Defaulting to system printer: {selected_name}")
+            logger.info(f" [i] Defaulting to system printer: {selected_name}")
         else:
             selected_name = printers[0]
 
@@ -199,7 +204,7 @@ def select_printer_interactive(
             config["printing"] = {}
         config["printing"]["printer_name"] = selected_name
         config_manager.save_config(config)
-        print(f" [✓] Saved target printer '{selected_name}' to config.json.")
+        logger.info(f" [✓] Saved target printer '{selected_name}' to config.json.")
 
     return selected_name, config
 
@@ -393,7 +398,7 @@ def enforce_queue_gate(
             if drain_start is None:
                 drain_start = time.time()
                 last_sig = current_sig
-                print(
+                logger.info(
                     f" [i] Spooler buffer full ({job_count}/{max_jobs} active jobs). "
                     f"Pacing dispatch while printer drains..."
                 )
@@ -418,6 +423,15 @@ def enforce_queue_gate(
         except Exception:
             pass
 
+        issue_summary = ", ".join(error_reasons) if error_reasons else f"Spooler queue stalled for >{int(stall_timeout)}s without progress"
+        logger.warning(
+            "Spooler alert on printer '%s' (pending_jobs=%d, max=%d): %s",
+            printer_name,
+            job_count,
+            max_jobs,
+            issue_summary,
+        )
+
         print("\n" + "=" * 65)
         print(" [!] HARDWARE / SPOOLER ALERT: PRINTER PAUSED")
         print("=" * 65)
@@ -441,19 +455,19 @@ def enforce_queue_gate(
         LAST_GATE_PROMPTED = True
         user_choice = input(" Select action ([Enter] / F / S / Q): ").strip().lower()
         if user_choice == "f":
-            print(" [!] Operator override: Forcing print job dispatch despite warning.")
+            logger.warning(" [!] Operator override: Forcing print job dispatch despite warning.")
             return True
         elif user_choice == "s":
-            print(" [i] Skipping print for this complaint.")
+            logger.info(" [i] Skipping print for this complaint.")
             return False
         elif user_choice == "q":
-            print(" [!] Batch operation aborted by operator.")
+            logger.warning(" [!] Batch operation aborted by operator.")
             raise KeyboardInterrupt("Print queue operation aborted by user.")
 
         # Reset drain timer for next check
         drain_start = None
         last_sig = None
-        print(" [i] Re-checking printer status...")
+        logger.info(" [i] Re-checking printer status...")
         time.sleep(1.0)
 
 
@@ -568,6 +582,7 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
                     del page
 
             dc.EndDoc()
+            logger.debug("Spooled '%s' (%d page(s)) to '%s' (job_id=%s).", pdf_path, total_pages, printer_name, job_id)
             if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
                 LAST_SPOOLED_JOB_ID = job_id
                 return job_id
@@ -726,15 +741,15 @@ def reconcile_print_job(
 def reconcile_in_flight_jobs(
     printer_name: str,
     in_flight: List[Dict[str, Any]],
-    tracker_file: str,
+    tracker_file: Optional[Union[str, Dict]] = None,
     status: Optional[Dict] = None
 ) -> Tuple[int, List[Tuple[str, str]]]:
     """
     Checks all currently in-flight spooled jobs against the Windows Spooler.
-    - Jobs that are CONFIRMED are immediately recorded as PRINTED in `tracker_file`
+    - Jobs that are CONFIRMED are immediately recorded as PRINTED in SQLite (`tracker_file`)
       and removed from `in_flight`.
-    - Jobs that have FAILED (deleted, error flag, printer error) are removed from
-      `in_flight` and returned in `failed_jobs` so they stay eligible for retry.
+    - Jobs that have FAILED (deleted, error flag, printer error) are marked PRINT_FAILED in SQLite,
+      removed from `in_flight`, and returned in `failed_jobs` so they stay eligible for retry.
     - Jobs still PENDING remain in `in_flight` while the printer continues processing.
 
     Returns:
@@ -761,12 +776,18 @@ def reconcile_in_flight_jobs(
             if not mark_complaint_printed(
                 tracker_file, c_num, p_path, printer_name, job_id=j_id
             ):
-                raise RuntimeError(f"Failed to record confirmed print for #{c_num} in '{tracker_file}'.")
+                raise RuntimeError(f"Failed to record confirmed print for #{c_num} in state database.")
             confirmed_now += 1
-            print(f"  [✓] Complaint #{c_num} confirmed printed on {printer_name}.")
+            logger.info(f"  [✓] Complaint #{c_num} confirmed printed on {printer_name}.")
         elif state == "FAILED":
+            try:
+                state_manager.mark_complaint_print_failed(
+                    tracker_file, c_num, file_path=p_path, printer_name=printer_name, job_id=j_id, reason=reason
+                )
+            except Exception as err:
+                logger.debug("Could not mark PRINT_FAILED for #%s: %s", c_num, err)
             failed_now.append((c_num, reason))
-            print(f"  [!] Complaint #{c_num} print not confirmed ({reason}); kept eligible for retry.")
+            logger.warning(f"  [!] Complaint #{c_num} print not confirmed ({reason}); kept eligible for retry.")
         else:
             remaining.append(item)
 
@@ -777,14 +798,14 @@ def reconcile_in_flight_jobs(
 def drain_in_flight_jobs(
     printer_name: str,
     in_flight: List[Dict[str, Any]],
-    tracker_file: str,
+    tracker_file: Optional[Union[str, Dict]] = None,
     stall_timeout: float = 60.0,
     poll_interval: float = 0.4,
     check_abort_fn: Optional[Callable[[], bool]] = None
 ) -> Tuple[int, List[Tuple[str, str]], bool]:
     """
     Waits for all remaining in-flight spooled jobs at the end of a batch to complete
-    and reconciles each into `tracker_file`.
+    and reconciles each into the SQLite state database.
     Resets the stall timer whenever a job completes or spooler progress occurs.
     If a hardware error occurs or the queue stalls for >= stall_timeout seconds,
     surfaces the interactive queue gate so the operator can clear the printer and resume.
@@ -797,13 +818,13 @@ def drain_in_flight_jobs(
     if not in_flight:
         return 0, [], False
 
-    print(f"\n[*] Waiting for {len(in_flight)} remaining spooled job(s) to finish printing on '{printer_name}'...")
+    logger.info(f"\n[*] Waiting for {len(in_flight)} remaining spooled job(s) to finish printing on '{printer_name}'...")
     stall_start = time.time()
     last_sig = None
 
     while in_flight:
         if check_abort_fn and check_abort_fn():
-            print("\n[!] Spooler drain interrupted by user (Esc pressed).")
+            logger.warning("\n[!] Spooler drain interrupted by user (Esc pressed).")
             return total_confirmed, total_failed, True
 
         status = get_queue_status(printer_name)
@@ -847,6 +868,17 @@ def drain_in_flight_jobs(
                 # Operator pressed [S] to skip waiting on remaining unconfirmed jobs
                 for item in list(in_flight):
                     c_num = item["complaint_no"]
+                    try:
+                        state_manager.mark_complaint_print_failed(
+                            tracker_file,
+                            c_num,
+                            file_path=item.get("file_path", ""),
+                            printer_name=printer_name,
+                            job_id=item.get("job_id"),
+                            reason="Skipped during final spooler drain by operator",
+                        )
+                    except Exception:
+                        pass
                     total_failed.append((c_num, "Skipped during final spooler drain by operator"))
                 in_flight.clear()
                 break
@@ -865,68 +897,28 @@ _ORIG_GET_QUEUE_STATUS = get_queue_status
 _ORIG_PRINT_PDF_SILENT = print_pdf_silent
 
 
-def _write_tracker_entry(
-    tracker_path: str,
-    complaint_no: str,
-    file_path: str = "",
-    printer_name: str = "",
-    status: str = "PRINTED",
-    job_id: Optional[int] = None
-) -> bool:
-    """
-    Atomically appends and fsyncs a status record to the tracker file.
-    Raises an exception if the write or sync fails.
-    """
-    complaint_no = str(complaint_no).strip()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    file_name = os.path.basename(file_path) if file_path else "N/A"
-    printer_label = printer_name or "Default"
-    status_label = str(status or "PRINTED").strip().upper()
-
-    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else None
-    if valid_job_id is not None:
-        log_entry = f"{complaint_no} | {timestamp} | {printer_label} | {file_name} | {status_label} | job_id={valid_job_id}\n"
-    else:
-        log_entry = f"{complaint_no} | {timestamp} | {printer_label} | {file_name} | {status_label}\n"
-
-    parent_dir = os.path.dirname(tracker_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-
-    try:
-        with open(tracker_path, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    except Exception as e:
-        print(f" [!] Error: Failed to write to {tracker_path}: {e}")
-        raise
-
-
 def mark_complaint_spooled(
-    tracker_path: str,
+    tracker_path: Optional[Union[str, Dict]],
     complaint_no: str,
     file_path: str = "",
     printer_name: str = "",
     job_id: Optional[int] = None
 ) -> bool:
     """
-    Records a complaint print job as SPOOLED (not yet confirmed printed) in the tracker file.
+    Records a complaint print job as SPOOLED (not yet confirmed printed) in the SQLite state database.
     Propagates write/sync failures by raising an exception.
     """
-    return _write_tracker_entry(
+    return state_manager.mark_complaint_spooled(
         tracker_path,
         complaint_no,
         file_path=file_path,
         printer_name=printer_name,
-        status="SPOOLED",
         job_id=job_id
     )
 
 
 def mark_complaint_printed(
-    tracker_path: str,
+    tracker_path: Optional[Union[str, Dict]],
     complaint_no: str,
     file_path: str = "",
     printer_name: str = "",
@@ -934,10 +926,10 @@ def mark_complaint_printed(
     job_id: Optional[int] = None
 ) -> bool:
     """
-    Atomically records a complaint as confirmed PRINTED in the tracker file.
-    Propagates tracker append or sync failures by raising an exception.
+    Atomically records a complaint as confirmed PRINTED in the SQLite state database.
+    Propagates database failures by raising an exception.
     """
-    return _write_tracker_entry(
+    return state_manager.mark_complaint_printed(
         tracker_path,
         complaint_no,
         file_path=file_path,
@@ -947,89 +939,20 @@ def mark_complaint_printed(
     )
 
 
-def load_printed_complaints(tracker_path: str = "printed_complaints.txt") -> Set[str]:
+def load_printed_complaints(tracker_path: Optional[Union[str, Dict]] = None) -> Set[str]:
     """
-    Loads all confirmed printed complaint numbers from the tracker file.
-    Complaints whose latest status is SPOOLED, FAILED, DELETED, or UNRESOLVED are not included
+    Loads all confirmed PRINTED complaint numbers from the SQLite state database.
+    Complaints whose status is DOWNLOADED, SPOOLED, or PRINT_FAILED are not included
     so they remain eligible for retry.
-    Propagates file read errors to the caller rather than returning an empty or partial set.
+    Propagates database errors to the caller rather than returning an empty or partial set.
     """
-    if not os.path.exists(tracker_path):
-        return set()
-
-    printed: Set[str] = set()
-    try:
-        with open(tracker_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = [p.strip() for p in line.split("|")]
-                token = parts[0].split(",")[0].strip()
-                if not token:
-                    continue
-                if len(parts) >= 5:
-                    entry_status = parts[4].upper()
-                    if entry_status == "PRINTED":
-                        printed.add(token)
-                    else:
-                        printed.discard(token)
-                else:
-                    # Legacy 1-column or 4-column confirmed print record
-                    printed.add(token)
-    except Exception as e:
-        print(f" [!] Error reading {tracker_path}: {e}")
-        raise
-    return printed
+    return state_manager.load_printed_complaints(tracker_path)
 
 
-def reset_printed_tracker_safe(tracker_path: str = "printed_complaints.txt") -> Optional[str]:
+def reset_printed_tracker_safe(tracker_path: Optional[Union[str, Dict]] = None) -> Optional[str]:
     """
-    Safely archives the existing printed_complaints.txt to a timestamped backup (.bak)
-    and initializes a clean tracking file with header metadata.
-    If archiving fails, aborts the reset before opening tracker_path with 'w' so the
-    original tracker and its print history are preserved.
-    Returns:
-        Backup file path if archived, or None.
+    Safely archives the SQLite state database to a timestamped backup (.db.bak)
+    and downgrades all SPOOLED/PRINTED/PRINT_FAILED states back to DOWNLOADED.
+    Preserves ERP download records so Mode [1] never re-downloads existing PDFs.
     """
-    import shutil
-
-    backup_path = None
-    if os.path.exists(tracker_path):
-        has_content = False
-        try:
-            with open(tracker_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip() and not line.strip().startswith("#"):
-                        has_content = True
-                        break
-        except Exception as e:
-            print(f" [!] Error reading {tracker_path} before reset: {e}")
-            raise
-
-        if has_content:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_dir = os.path.dirname(os.path.abspath(tracker_path))
-            backup_name = f"printed_complaints_{ts}.bak"
-            backup_path = os.path.join(base_dir, backup_name)
-            try:
-                shutil.copy2(tracker_path, backup_path)
-                print(f" [✓] Previous print tracker archived to: {backup_name}")
-            except Exception as e:
-                print(f" [!] Error: Failed to create archive backup '{backup_path}': {e}")
-                print(" [!] Aborting tracker reset to preserve existing print history.")
-                raise
-
-    parent_dir = os.path.dirname(tracker_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-
-    try:
-        with open(tracker_path, "w", encoding="utf-8") as f:
-            f.write("# COMPLAINT_NO | TIMESTAMP | PRINTER | FILE | STATUS\n")
-        print(f" [✓] Print tracker '{os.path.basename(tracker_path)}' reset to clean state.")
-    except Exception as e:
-        print(f" [!] Error resetting tracker file {tracker_path}: {e}")
-        raise
-
-    return backup_path
+    return state_manager.reset_printed_tracker_safe(tracker_path)

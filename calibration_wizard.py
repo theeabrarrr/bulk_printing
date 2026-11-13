@@ -20,6 +20,9 @@ except ImportError:
     winsound = None
 
 import config_manager
+import logger_manager
+
+logger = logger_manager.get_logger("calibration_wizard")
 
 TARGETS = [
     ("complaint_input", "1. Complaint Number Field (where complaint # is entered)"),
@@ -102,17 +105,17 @@ def replay_cursor_verification(coords, targets=None):
 
     for key, label in targets:
         if keyboard.is_pressed('esc'):
-            print("\n[!] Visual cursor replay aborted by user (Esc pressed).")
+            logger.warning("\n[!] Visual cursor replay aborted by user (Esc pressed).")
             break
         pt = coords.get(key, {})
         x = pt.get("x")
         y = pt.get("y")
         if x is not None and y is not None:
-            print(f" -> Moving to: {label} [X: {x}, Y: {y}]")
+            logger.info(f" -> Moving to: {label} [X: {x}, Y: {y}]")
             pyautogui.moveTo(x, y, duration=0.8)
             time.sleep(0.5)
 
-    print("\nVisual cursor replay complete!")
+    logger.info("\nVisual cursor replay complete!")
     print("=" * 55 + "\n")
 
 
@@ -146,14 +149,14 @@ def configure_printer_menu(cfg=None):
     if target_to_test:
         test_ans = input(f"Would you like to check spooler status for '{target_to_test}'? [y/N]: ").strip().lower()
         if test_ans in ["y", "yes"]:
-            print(f" [*] Querying Windows Spooler for '{target_to_test}'...")
+            logger.info(f" [*] Querying Windows Spooler for '{target_to_test}'...")
             q_status = pm.get_queue_status(target_to_test)
             print(f"     Status: {'OK' if not q_status['has_error'] else 'ALERT'}")
             print(f"     Active Spooler Jobs: {q_status['job_count']}")
             if q_status['has_error']:
-                print(f"     Errors: {', '.join(q_status['error_reasons'])}")
+                logger.warning(f"     Errors: {', '.join(q_status['error_reasons'])}")
             else:
-                print("     [+] Spooler reported no error flags.")
+                logger.info("     [+] Spooler reported no error flags.")
 
     # Save to config
     if "printing" not in cfg:
@@ -161,7 +164,7 @@ def configure_printer_menu(cfg=None):
     cfg["printing"]["printer_name"] = selected_name
     cfg["printing"]["max_spool_queue"] = max_q
     config_manager.save_config(cfg)
-    print("\n[+] Printer configuration successfully saved to config.json!")
+    logger.info("\n[+] Printer configuration successfully saved to config.json!")
     return True
 
 
@@ -177,6 +180,7 @@ def run_calibration_wizard():
         cfg = config_manager.DEFAULT_CONFIG.copy()
 
     screen_w, screen_h = pyautogui.size()
+    logger.debug("Calibration wizard opened (resolution=%dx%d).", screen_w, screen_h)
 
     print("\n" + "=" * 60)
     print("    ORACLE ERP AUTOMATION SUITE - CALIBRATION WIZARD")
@@ -206,9 +210,10 @@ def run_calibration_wizard():
         print("Returning to main menu...")
         return False
     else:
-        print("[!] Invalid selection. Returning to main menu.")
+        logger.warning("[!] Invalid selection. Returning to main menu.")
         return False
 
+    logger.info("Starting calibration for scope: %s (%d targets).", scope_name, len(selected_targets))
     print("\n" + "=" * 60)
     print(f"    CALIBRATING: {scope_name.upper()} ({len(selected_targets)} Targets)")
     print("=" * 60)
@@ -232,7 +237,7 @@ def run_calibration_wizard():
             x, y = wait_for_capture()
 
             if x is None and y is None:
-                print("\n[!] Calibration aborted by user.")
+                logger.warning("\n[!] Calibration aborted by user.")
                 return False
 
             print(f"  Captured: X = {x}, Y = {y}")
@@ -240,6 +245,7 @@ def run_calibration_wizard():
 
             if choice_sub in ["", "y", "yes"]:
                 new_coords[key] = {"x": int(x), "y": int(y)}
+                logger.debug("Captured coordinate for '%s': (%d, %d).", key, int(x), int(y))
                 break
             elif choice_sub in ["r", "retry"]:
                 print("  Retrying target capture...")
@@ -256,7 +262,7 @@ def run_calibration_wizard():
     }
 
     config_manager.save_config(cfg)
-    print("\n[+] Coordinates and screen metadata successfully saved to config.json!")
+    logger.info("\n[+] Coordinates and screen metadata successfully saved to config.json!")
 
     # Tier 1 Verification: Visual Cursor Replay
     replay_cursor_verification(new_coords, selected_targets)
@@ -279,11 +285,11 @@ def run_calibration_wizard():
             test_no = input("  Enter Complaint Number for test run [default: 282636629]: ").strip()
             if not test_no:
                 test_no = "282636629"
-            print(f"\n[*] Running Tier 2 verification test with complaint #{test_no}...")
+            logger.info(f"\n[*] Running Tier 2 verification test with complaint #{test_no}...")
             import engine
             engine.process_complaint(test_no, "Calibration_Test", config=cfg, record_progress=False)
 
-    print("\nCalibration Wizard finished successfully!")
+    logger.info("\nCalibration Wizard finished successfully!")
     return True
 
 
