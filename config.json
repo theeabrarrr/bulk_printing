@@ -35,7 +35,8 @@
     "complaint_column": "COMPLAINT_NO",
     "technician_column": "TECHNICIAN_NAME",
     "output_dir": "Today_Complaints",
-    "progress_file": "completed_complaints.txt"
+    "progress_file": "completed_complaints.txt",
+    "database_file": "complaints_state.db"
   },
   "printing": {
     "printer_name": null,

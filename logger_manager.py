@@ -23,6 +23,17 @@ _ACTIVE_LOG_FILE_PATH: Optional[str] = None
 _ORIG_EXCEPTHOOK = sys.excepthook
 
 
+def _ensure_utf8_streams() -> None:
+    """Ensures sys.stdout and sys.stderr are configured for UTF-8 on Windows consoles."""
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if hasattr(stream, "reconfigure"):
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _resolve_log_level(level_name: str, default: int = logging.DEBUG) -> int:
     """Resolves a string level name (e.g., 'DEBUG', 'INFO') to a logging constant."""
     if isinstance(level_name, int):
@@ -88,6 +99,8 @@ def setup_logging(
         Configured base logging.Logger ('erp_automation').
     """
     global _LOGGING_INITIALIZED, _ACTIVE_LOG_FILE_PATH
+
+    _ensure_utf8_streams()
 
     log_cfg = config_manager.get_logging_settings(config)
     log_dir = config_manager.resolve_path(log_cfg.get("log_dir", "logs"))

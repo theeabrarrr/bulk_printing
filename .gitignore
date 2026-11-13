@@ -6,3 +6,8 @@ build/
 dist/
 Test_Output/
 Today_Complaints/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.bak

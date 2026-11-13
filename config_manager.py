@@ -41,7 +41,8 @@ DEFAULT_CONFIG = {
         "complaint_column": "COMPLAINT_NO",
         "technician_column": "TECHNICIAN_NAME",
         "output_dir": "Today_Complaints",
-        "progress_file": "completed_complaints.txt"
+        "progress_file": "completed_complaints.txt",
+        "database_file": "complaints_state.db"
     },
     "printing": {
         "printer_name": None,
@@ -89,6 +90,19 @@ def resolve_path(relative_or_absolute_path):
     if os.path.isabs(relative_or_absolute_path):
         return relative_or_absolute_path
     return os.path.join(get_base_dir(), relative_or_absolute_path)
+
+def get_database_path(config=None):
+    """Returns the resolved absolute path to the SQLite state database file."""
+    if config is None:
+        try:
+            config = load_config() or DEFAULT_CONFIG
+        except Exception:
+            config = DEFAULT_CONFIG
+    settings = config.get("settings", DEFAULT_CONFIG["settings"])
+    db_rel = settings.get("database_file", DEFAULT_CONFIG["settings"]["database_file"])
+    if not db_rel or not str(db_rel).strip():
+        db_rel = DEFAULT_CONFIG["settings"]["database_file"]
+    return resolve_path(str(db_rel).strip())
 
 def load_config(config_path=None):
     """
