@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 5: Universal Silent Printing & Spooler Integration)
-**Document Version:** 1.7.0  
-**Status:** Completed (Phase 5: Universal Silent Physical Printing & Spooler Queue Monitoring)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 6: Enterprise Architecture, SQLite State & Observability)
+**Document Version:** 2.0.0  
+**Status:** Completed (Phase 6: SQLite WAL State Management, Rotating Logging & Strict Excel Validation)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
@@ -11,36 +11,33 @@ To maintain full system stability and traceability across development and deploy
 
 1. **Git Integration & Traceability**:
    - Every completed step and code modification strictly requires an immediate Git commit with a clear, descriptive, standardized commit message following Conventional Commits format (`feat(...)`, `fix(...)`, `docs(...)`, etc.).
-   - Every commit must be pushed to the remote feature repository (`origin/feature/silent-printing`). Do not merge into `main` directly.
    - No untracked or undocumented changes are permitted.
 2. **No Unprompted Refactoring**:
    - Working code from previous phases (e.g., `masterbot.py`, verified delay timings, and GUI interaction sequences) must NEVER be modified, rewritten, or refactored unless explicitly instructed by the user.
 3. **Strict PRD & Step-by-Step Plan Alignment**:
    - Do not invent new logic or diverge from specifications. All implementations must map 100% directly to this PRD and the approved Execution Plan.
-4. **Step-by-Step Approval Gate**:
-   - Each phase step must be executed individually and presented for user review and approval before proceeding to the next step.
 
 ---
 
 ### 2. Executive Summary & Problem Statement
-The RPA bot automates extraction of complaint job cards from an Oracle Forms ERP application, generates PDFs via Internet Explorer / Foxit Reader, organizes them into technician-specific folders based on an Excel file, and automates OTP generation.
+The RPA bot automates extraction of complaint job cards from an Oracle Forms ERP application, generates PDFs via Internet Explorer / Foxit Reader, organizes them into technician-specific folders based on an Excel file, performs silent physical printing via Windows GDI (`pypdfium2` + `win32ui`), and automates OTP generation.
 
-In Phase 5, we integrate **Universal Silent Physical Printing**:
-- Eliminates reliance on external PDF viewers (Foxit, Acrobat, Edge) for physical printing, preventing GUI pop-ups or taskbar window focus theft that could disrupt Oracle Forms automation.
-- Directly renders PDF pages into Windows GDI Printer Device Contexts using `pypdfium2` and `win32ui`/`win32print`.
-- Monitors the Windows Print Spooler queue. If jobs accumulate (default threshold: 3) or hardware/spooler errors occur (paper jam, tray empty, offline, paused printer/job, or spooler query errors), the bot alerts the operator and pauses execution.
-- Introduces **Dual Print Modes**: Live Print (print on download with resume retry for unprinted saved PDFs) and Offline Batch Print (process existing PDFs in `Today_Complaints/` with resume awareness).
-
-**Phase 5 Objectives:**
-1. **Universal Headless GDI Rendering**: Use `pypdfium2` and `win32ui`/`win32print` to render PDF pages directly into the Windows GDI DC. 100% silent, zero pop-ups, works across all PCL, PostScript, and GDI printer drivers.
-2. **Spooler Queue Monitoring & Failsafe**: Query active jobs (`cJobs`) and status flags (`PRINTER_STATUS_PAUSED`, `PRINTER_STATUS_PAPER_JAM`, `PRINTER_STATUS_PAPER_OUT`, `JOB_STATUS_PAUSED`, `JOB_STATUS_ERROR`, etc.), and surface `GetPrinter`/`EnumJobs` failures as alerts. Pause with audio alerts if queue reaches threshold or error flags are present, and restore ERP window focus after interactive queue gate choices.
-3. **Printer Setup in Calibration Wizard & Main Menu**: Sub-menu option `[4] Configure Physical Printer & Spooler` in Calibration Wizard and Main Menu option `[6] Select / Change Target Printer` to enumerate connected printers (`1..N`), validate physical vs. virtual classification, set queue limit, and check spooler error flags.
-4. **Configuration Schema Expansion**: Add `"printing"` section to `config.json` and `config_manager.py` with automatic physical/default printer fallback.
-5. **Resume Tracking & Job Reconciliation (`printed_complaints.txt`)**: Track PDF completion (`completed_complaints.txt`) separately from print completion (`printed_complaints.txt`). Record jobs as `SPOOLED` upon `EndDoc` and reconcile against the spooler before recording `PRINTED`, keeping failed, deleted, or unresolved jobs eligible for retry.
-6. **Dual Print Integration**:
-   - **Live Print**: Immediately spools and reconciles PDF upon download in Bulk Mode `[1]` and Manual Mode `[2]`, and retries unprinted saved PDFs upon resume.
-   - **Offline Batch Print**: Main Menu option `[5]` to discover Technician subfolders inside `Today_Complaints/`, display per-folder `[Total | Printed | Pending]` counts, support single/multi/all folder selection, and stream documents via a progress-aware Sliding-Window Spooler Pipeline (`reconcile_in_flight_jobs` + `drain_in_flight_jobs`).
-7. **One-Dir Packaging**: Update `build.py` to bundle `pypdfium2` DLLs and `pywin32` runtime modules into `dist/ERP_Automation_Suite/`.
+In **Phase 6**, we upgrade the underlying architecture to enterprise-grade standards:
+1. **SQLite State Management (`state_manager.py` / `complaints_state.db`)**:
+   - Replaces legacy flat text files (`completed_complaints.txt`, `printed_complaints.txt`) with an ACID-compliant local SQLite database operating in Write-Ahead Logging (`WAL`) mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`).
+   - Tracks unified progressive lifecycle states (`DOWNLOADED`, `SPOOLED`, `PRINTED`, `PRINT_FAILED`) alongside `technician`, `file_path`, `printer_name`, `job_id`, `created_at`, and `updated_at`.
+   - Automatically migrates existing legacy `.txt` files on first run and renames them to `.migrated.bak`.
+   - Supports non-destructive print tracker resets (`[R] Reset Global Print Tracker` in Mode `[5]`), archiving a consistent SQLite backup (`complaints_state_<timestamp>.db.bak`) via `sqlite3.Connection.backup()` and downgrading `SPOOLED`/`PRINTED`/`PRINT_FAILED` rows back to `DOWNLOADED` so ERP downloads are never lost.
+2. **Enterprise-Grade Centralized Logging (`logger_manager.py`)**:
+   - Dual-channel logging architecture:
+     - **File Handler**: `RotatingFileHandler` writing to `logs/app.log` (5 MB max size, 5 backups, UTF-8, `DEBUG` level) with full timestamps, `module:function:line`, and full stack traces (`exc_info=True`).
+     - **Console Handler**: `StreamHandler` (`INFO` level) with clean, operator-friendly formatting while preserving crisp interactive CLI menus and tables.
+     - **Crash Hook**: Global `sys.excepthook` guarantees any unhandled fatal exception is captured in `logs/app.log`.
+3. **Strict Excel Input Validation & Sanitization (`main.py`)**:
+   - Normalizes column headers (whitespace stripping + case-insensitive fallback matching).
+   - Enforces strict numeric-digit validation for `COMPLAINT_NO` (after stripping whitespace and `.0` float suffixes), safely skipping and logging empty rows, formula error strings (`#REF!`, `#N/A`, `#VALUE!`), and malformed entries with exact 1-based Excel row numbers.
+   - Deduplicates repeated `COMPLAINT_NO` values within the sheet (preserving first occurrence) and sanitizes `TECHNICIAN_NAME` (defaulting blanks to `'Unknown'`).
+   - Displays a **Pre-Flight Validation Summary** before batch execution begins.
 
 ---
 
@@ -52,63 +49,62 @@ flowchart TD
         EXE["ERP_Automation_Suite.exe"]
         CFG["config.json"]
         XLSX["complaints.xlsx"]
-        TXT["completed_complaints.txt"]
-        PTXT["printed_complaints.txt"]
+        DB[("complaints_state.db (SQLite WAL)")]
+        LOG["logs/app.log (Rotating 5MB x 5)"]
         OUT["Today_Complaints/"]
     end
 
     subgraph CoreEngine ["Modular Codebase Structure"]
-        MAIN["main.py (Menu Router & Batch Print)"]
+        MAIN["main.py (Menu Router, Excel Validator & Batch Print)"]
         SETUP["calibration_wizard.py (Setup & Printer Config)"]
         ENGINE["engine.py (RPA Pipeline & Live Print)"]
         PRINTMGR["printer_manager.py (GDI Render & Queue Gate)"]
+        STATEMGR["state_manager.py (SQLite DAL & .txt Migrator)"]
+        LOGMGR["logger_manager.py (Rotating File & Console Logger)"]
         CFGMGR["config_manager.py (Path Anchoring & Schema)"]
         BUILD["build.py (PyInstaller Packaging)"]
     end
 
     EXE --> MAIN
     MAIN --> CFGMGR
+    MAIN --> LOGMGR
+    MAIN --> STATEMGR
     MAIN --> SETUP
     MAIN --> ENGINE
     MAIN --> PRINTMGR
     ENGINE --> PRINTMGR
+    ENGINE --> STATEMGR
+    ENGINE --> LOGMGR
+    PRINTMGR --> STATEMGR
+    PRINTMGR --> LOGMGR
     SETUP --> PRINTMGR
+    SETUP --> LOGMGR
     CFGMGR <--> CFG
-    ENGINE --> XLSX
-    ENGINE --> TXT
+    MAIN --> XLSX
+    STATEMGR <--> DB
+    LOGMGR --> LOG
     ENGINE --> OUT
-    PRINTMGR --> PTXT
 ```
 
 #### 3.1 File & Module Responsibilities
-- **`printer_manager.py`** *(NEW - COMPLETED)*:
-  - Enumerates connected Windows printers via `win32print.EnumPrinters()` with graceful error handling.
-  - Queries active spooler job count (`cJobs`) and printer/job error and pause status flags (`PRINTER_STATUS_PAUSED`, `JOB_STATUS_PAUSED`, etc.), treating `GetPrinter` and `EnumJobs` failures as alerts.
-  - Implements `enforce_queue_gate()` to pause with audio alerts when queue is backed up or in error/paused state.
-  - Implements `print_pdf_silent()`: headless page-by-page rasterization via `pypdfium2` streamed to GDI Printer DC (`win32ui`).
-  - Implements `mark_complaint_spooled()`, `reconcile_print_job()`, `mark_complaint_printed()`, `load_printed_complaints()`, and `reset_printed_tracker_safe()` with strict error propagation and safe backup verification.
+- **`state_manager.py`** *(NEW - COMPLETED)*:
+  - Manages `complaints_state.db` in SQLite WAL mode with `busy_timeout=15000`.
+  - Auto-migrates legacy `completed_complaints.txt` and `printed_complaints.txt` into SQLite and renames them to `.migrated.bak`.
+  - Provides transactional state mutations (`mark_complaint_downloaded`, `mark_complaint_spooled`, `mark_complaint_printed`, `mark_complaint_print_failed`, `reset_printed_tracker_safe`) and queries (`get_completed_complaints`, `load_printed_complaints`).
+- **`logger_manager.py`** *(NEW - COMPLETED)*:
+  - Configures centralized `erp_automation` logger hierarchy with `RotatingFileHandler` (`logs/app.log`, 5 MB, 5 backups, UTF-8, `DEBUG`+) and console `StreamHandler` (`INFO`+), plus `sys.excepthook`.
+- **`printer_manager.py`** *(UPDATED - COMPLETED)*:
+  - Headless GDI PDF rendering via `pypdfium2` + `win32ui`, spooler queue monitoring, sliding-window reconciliation, and SQLite state persistence via `state_manager`.
 - **`config_manager.py`** *(UPDATED - COMPLETED)*:
-  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness.
-  - Validates and provides fallback resolution for `"printing"` section (`printer_name`, `max_spool_queue`, `enable_live_print`, `printed_tracker_file`).
+  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness, and schema defaults/validation for `coordinates`, `timings`, `settings` (`database_file`), `printing`, and `logging`.
 - **`calibration_wizard.py`** *(UPDATED - COMPLETED)*:
-  - Coordinate calibration for Print (5), OTP (4), or All (9) targets.
-  - Sub-menu option `[4] Configure Physical Printer & Spooler` for printer selection, queue limits, and spooler error flag check.
+  - Coordinate calibration for Print (5), OTP (4), or All (9) targets, and physical printer configuration with structured logging.
 - **`engine.py`** *(UPDATED - COMPLETED)*:
-  - Unified RPA loop for complaint extraction and PDF creation with global ESC key latching and `Ctrl+C` handling.
-  - Live Print dispatch: verifies queue gate, restores ERP foreground focus after interactive gate prompts, spools and reconciles print jobs, and retries saved PDFs missing from `printed_complaints.txt` on batch resume.
-  - OTP generation routine (`generate_otp()`).
+  - Unified RPA loop for complaint extraction and PDF creation with global ESC key latching, `Ctrl+C` handling, SQLite progress tracking, and Live Print dispatch.
 - **`main.py`** *(UPDATED - COMPLETED)*:
-  - Primary menu:
-    - `[1] Bulk Mode (Process complaints.xlsx)` (with routing & live print prompts)
-    - `[2] Manual Mode (Process single/batch complaint #s)` (with live print prompt)
-    - `[3] Recalibrate Coordinates (Setup Wizard)`
-    - `[4] Generate OTP (Interactive Mode)`
-    - `[5] Batch Print Offline PDFs (Today_Complaints)`
-    - `[6] Select / Change Target Printer`
-    - `[7] Exit`
-  - Manages runtime file and parent directory creation (`completed_complaints.txt`, `printed_complaints.txt`).
+  - Primary menu (`[1]`–`[7]`), strict Excel validation & Pre-Flight Validation Summary (`validate_excel_dataframe`, `validate_and_load_excel_records`), and SQLite-backed Offline Batch Print (`[5]`).
 - **`build.py`** *(UPDATED - COMPLETED)*:
-  - Compiles `--onedir` distribution `dist/ERP_Automation_Suite/` with `pypdfium2` binaries and `pywin32` hidden imports.
+  - Compiles `--onedir` distribution `dist/ERP_Automation_Suite/` preserving `complaints_state.db`, `logs/`, `Today_Complaints/`, `config.json`, and `complaints.xlsx`.
 
 ---
 
@@ -152,13 +148,22 @@ flowchart TD
     "complaint_column": "COMPLAINT_NO",
     "technician_column": "TECHNICIAN_NAME",
     "output_dir": "Today_Complaints",
-    "progress_file": "completed_complaints.txt"
+    "progress_file": "completed_complaints.txt",
+    "database_file": "complaints_state.db"
   },
   "printing": {
     "printer_name": null,
     "max_spool_queue": 3,
     "enable_live_print": false,
     "printed_tracker_file": "printed_complaints.txt"
+  },
+  "logging": {
+    "log_dir": "logs",
+    "log_file": "app.log",
+    "max_bytes": 5242880,
+    "backup_count": 5,
+    "file_level": "DEBUG",
+    "console_level": "INFO"
   }
 }
 ```
@@ -171,23 +176,9 @@ flowchart TD
 | :--- | :--- | :---: | :--- |
 | **Phase 3** | **Architecture & Hardening** | **COMPLETED** | Decoupled config, calibration wizard, dual-input, PyInstaller packaging. |
 | **Phase 4** | **OTP & One-Dir Packaging** | **COMPLETED** | OTP module, one-dir packaging, routing & batch enhancements. |
-| **5.1** | **Dependencies & Feature Branch** | **COMPLETED** | Create `feature/silent-printing`, add `pywin32` & `pypdfium2` to `requirements.txt`. |
-| **5.2** | **Print & Queue Manager** | **COMPLETED** | Create `printer_manager.py` with headless GDI rendering and spooler monitoring. |
-| **5.3** | **Schema & Config Modernization** | **COMPLETED** | Expand `config.json` & `config_manager.py` with `"printing"` section & validation. |
-| **5.4** | **Calibration Wizard Expansion** | **COMPLETED** | Add option `[4]` to `calibration_wizard.py` for printer selection & queue limit. |
-| **5.5** | **Resume Tracker & Reconciliation** | **COMPLETED** | Implement `printed_complaints.txt` management, `SPOOLED` vs `PRINTED` reconciliation, and error propagation. |
-| **5.6** | **Dual Print Modes Integration** | **COMPLETED** | Live Print in `engine.py` (with focus restoration & resume retry) and Offline Batch Print `[5]` in `main.py`. |
-| **5.7** | **Packaging & Verification** | **COMPLETED** | Bundle `pypdfium2` and `pywin32` into `dist/ERP_Automation_Suite/`. |
-| **5.8** | **Documentation & Audit** | **COMPLETED** | Synchronize `PRD.md` and `README.md` with Phase 5 specs. |
-
----
-
-### 6. Audit & Traceability
-Every phase step is committed and pushed with clear descriptions:
-- **Step 5.1**: `chore(deps): initialize feature/silent-printing and add pywin32, pypdfium2 dependencies`
-- **Step 5.2**: `feat(print): create printer_manager with headless GDI rendering and spooler queue monitoring`
-- **Step 5.3**: `feat(config): expand config schema with printing preferences and validation rules`
-- **Step 5.4**: `feat(wizard): add printer selection and test-print verification to calibration wizard`
-- **Step 5.5 & 5.6**: `feat(engine): integrate live printing, resume tracker, and offline batch print mode [5]`
-- **Step 5.7**: `chore(build): configure PyInstaller bundling for pypdfium2 and pywin32 in onedir distribution`
-- **Step 5.8**: `docs: update PRD and README with Phase 5 silent printing specifications`
+| **Phase 5** | **Silent Physical Printing** | **COMPLETED** | Headless GDI rendering, spooler monitoring, sliding-window batch print. |
+| **6.1** | **Centralized Logging (`logger_manager.py`)** | **COMPLETED** | Dual-channel `RotatingFileHandler` (`logs/app.log`, 5 MB x 5) + console logger & crash hook. |
+| **6.2** | **SQLite State Engine (`state_manager.py`)** | **COMPLETED** | SQLite WAL database (`complaints_state.db`), progressive status schema & legacy `.txt` auto-migration. |
+| **6.3** | **Core Engine & Spooler Integration** | **COMPLETED** | Integrate `state_manager` and `logger_manager` across `engine.py`, `printer_manager.py`, and `calibration_wizard.py`. |
+| **6.4** | **Strict Excel Input Validation** | **COMPLETED** | Implement header normalization, numeric ID validation, deduplication, and Pre-Flight Validation Summary in `main.py`. |
+| **6.5** | **Packaging & Documentation** | **COMPLETED** | Update `build.py` runtime preservation for SQLite/logs and synchronize `PRD.md` & `README.md`. |

@@ -6,6 +6,7 @@ import tempfile
 
 try:
     import config_manager
+    import state_manager
 except ImportError as e:
     if getattr(e, "name", None) == "pyautogui":
         print("\n[!] Missing required dependency: 'pyautogui'.")
@@ -21,9 +22,13 @@ ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
 RUNTIME_PRESERVE_ITEMS = [
     "config.json",
     "complaints.xlsx",
+    "complaints_state.db",
+    "complaints_state.db-wal",
+    "complaints_state.db-shm",
     "completed_complaints.txt",
     "printed_complaints.txt",
     "Today_Complaints",
+    "logs",
 ]
 
 
@@ -54,13 +59,16 @@ def verify_frozen_path_anchoring():
         sys.executable = fake_exe_dir
         resolved_base = config_manager.get_base_dir()
         resolved_cfg = config_manager.get_config_path()
+        resolved_db = config_manager.get_database_path()
         expected_base = os.path.dirname(fake_exe_dir)
 
         print(f"  Simulated Executable: {fake_exe_dir}")
         print(f"  Resolved Base Dir:    {resolved_base}")
         print(f"  Resolved Config Path: {resolved_cfg}")
+        print(f"  Resolved DB Path:     {resolved_db}")
 
         assert resolved_base == expected_base, f"Mismatch: {resolved_base} != {expected_base}"
+        assert os.path.dirname(resolved_db) == expected_base, f"DB Path mismatch: {resolved_db}"
         print("  [+] One-Dir frozen path anchoring verified successfully!")
     finally:
         if orig_frozen:
@@ -72,7 +80,7 @@ def verify_frozen_path_anchoring():
 
 
 def _backup_runtime_data(suite_dir, backup_dir):
-    """Preserves existing runtime files and Today_Complaints/ before PyInstaller wipes suite_dir."""
+    """Preserves existing runtime files, SQLite DB, logs/, and Today_Complaints/ before PyInstaller wipes suite_dir."""
     preserved = []
     if not os.path.exists(suite_dir):
         return preserved
@@ -80,7 +88,11 @@ def _backup_runtime_data(suite_dir, backup_dir):
     items_to_check = list(RUNTIME_PRESERVE_ITEMS)
     try:
         for entry in os.listdir(suite_dir):
-            if entry.startswith("printed_complaints_") and entry.endswith(".bak"):
+            if (
+                (entry.startswith("printed_complaints_") and entry.endswith(".bak"))
+                or (entry.startswith("complaints_state_") and entry.endswith(".db.bak"))
+                or entry.endswith(".migrated.bak")
+            ):
                 if entry not in items_to_check:
                     items_to_check.append(entry)
     except Exception:
@@ -99,7 +111,7 @@ def _backup_runtime_data(suite_dir, backup_dir):
 
 
 def _restore_runtime_data(backup_dir, suite_dir, preserved_items):
-    """Restores preserved runtime files and Today_Complaints/ into suite_dir after build."""
+    """Restores preserved runtime files, SQLite DB, logs/, and Today_Complaints/ into suite_dir after build."""
     os.makedirs(suite_dir, exist_ok=True)
     for item in preserved_items:
         src = os.path.join(backup_dir, item)
@@ -141,6 +153,7 @@ def build_executable():
         "--name",
         PACKAGE_NAME,
         "--collect-all", "pypdfium2",
+        "--hidden-import", "sqlite3",
         "--hidden-import", "win32print",
         "--hidden-import", "win32ui",
         "--hidden-import", "win32con",
@@ -200,19 +213,26 @@ def build_executable():
             shutil.copy2(src_xlsx, dest_xlsx)
             print(f"  [+] Input dataset deployed to: {dest_xlsx}")
 
-        # Ensure completed_complaints.txt exists
-        dest_tracker = os.path.join(suite_dir, "completed_complaints.txt")
-        if not os.path.exists(dest_tracker):
-            with open(dest_tracker, "w", encoding="utf-8") as f:
-                pass
-            print(f"  [+] Initialized tracking file: {dest_tracker}")
+        # Ensure logs/ directory exists in suite folder
+        dest_logs = os.path.join(suite_dir, "logs")
+        os.makedirs(dest_logs, exist_ok=True)
+        print(f"  [+] Initialized rotating logs directory: {dest_logs}")
 
-        # Ensure printed_complaints.txt exists
-        dest_print_tracker = os.path.join(suite_dir, "printed_complaints.txt")
-        if not os.path.exists(dest_print_tracker):
-            with open(dest_print_tracker, "w", encoding="utf-8") as f:
-                pass
-            print(f"  [+] Initialized print tracking file: {dest_print_tracker}")
+        # Initialize SQLite state database and migrate any legacy .txt files in suite_dir
+        dest_db = os.path.join(suite_dir, "complaints_state.db")
+        state_manager.init_db(dest_db)
+        dest_completed_txt = os.path.join(suite_dir, "completed_complaints.txt")
+        dest_printed_txt = os.path.join(suite_dir, "printed_complaints.txt")
+        dest_out_dir = os.path.join(suite_dir, "Today_Complaints")
+        if os.path.exists(dest_completed_txt) or os.path.exists(dest_printed_txt):
+            state_manager.migrate_legacy_txt_files(
+                db_path=dest_db,
+                completed_txt_path=dest_completed_txt,
+                printed_txt_path=dest_printed_txt,
+                output_dir=dest_out_dir,
+                archive_after_migrate=True,
+            )
+        print(f"  [+] Initialized SQLite state database: {dest_db}")
 
         print("\n" + "=" * 60)
         print("  BUILD SUCCESSFUL!")
