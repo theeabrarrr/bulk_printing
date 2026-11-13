@@ -48,6 +48,14 @@ DEFAULT_CONFIG = {
         "max_spool_queue": 3,
         "enable_live_print": False,
         "printed_tracker_file": "printed_complaints.txt"
+    },
+    "logging": {
+        "log_dir": "logs",
+        "log_file": "app.log",
+        "max_bytes": 5242880,
+        "backup_count": 5,
+        "file_level": "DEBUG",
+        "console_level": "INFO"
     }
 }
 
@@ -204,6 +212,36 @@ def get_printing_settings(config=None):
         merged["max_spool_queue"] = 3
 
     merged["enable_live_print"] = bool(merged.get("enable_live_print", False))
+    return merged
+
+def get_logging_settings(config=None):
+    """
+    Returns the logging configuration dictionary, ensuring default fallbacks and type safety.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    logging_cfg = config.get("logging", {})
+    default_logging = DEFAULT_CONFIG["logging"]
+
+    merged = {}
+    for k, v in default_logging.items():
+        merged[k] = logging_cfg.get(k, v)
+
+    try:
+        merged["max_bytes"] = max(1024, int(merged.get("max_bytes", 5242880)))
+    except (ValueError, TypeError):
+        merged["max_bytes"] = 5242880
+
+    try:
+        merged["backup_count"] = max(1, int(merged.get("backup_count", 5)))
+    except (ValueError, TypeError):
+        merged["backup_count"] = 5
+
+    merged["log_dir"] = str(merged.get("log_dir") or "logs").strip()
+    merged["log_file"] = str(merged.get("log_file") or "app.log").strip()
+    merged["file_level"] = str(merged.get("file_level") or "DEBUG").strip().upper()
+    merged["console_level"] = str(merged.get("console_level") or "INFO").strip().upper()
     return merged
 
 def get_configured_printer(config=None):
