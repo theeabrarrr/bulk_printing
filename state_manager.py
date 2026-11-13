@@ -8,6 +8,7 @@ Replaces completed_complaints.txt and printed_complaints.txt with a crash-safe S
 from contextlib import contextmanager
 from datetime import datetime
 import os
+import re
 import shutil
 import sqlite3
 from typing import Dict, Iterator, Optional, Set, Tuple, Union
@@ -48,7 +49,7 @@ def _infer_technician_from_path(file_path: str) -> str:
         return "Unknown"
     try:
         parent_name = os.path.basename(os.path.dirname(os.path.abspath(file_path)))
-        if parent_name and parent_name not in ("Today_Complaints", "All_PDFs", ".", ""):
+        if parent_name and parent_name not in ("Today_Complaints", "All_PDFs", "Manual_Batch", ".", ""):
             return parent_name
     except Exception:
         pass
@@ -114,40 +115,154 @@ def _connect_db(db_path: str) -> Iterator[sqlite3.Connection]:
             pass
 
 
-def init_db(target: Optional[Union[str, Dict]] = None) -> str:
+def init_db(
+    target: Optional[Union[str, Dict]] = None,
+    output_dir: Optional[str] = None,
+    sync_disk: bool = True,
+    announce_sync: bool = True,
+) -> str:
     """
     Initializes the SQLite database file, WAL journal mode, table schema, and indexes.
+    When sync_disk is True, also runs an idempotent Startup Disk-to-DB Sync against Today_Complaints/.
     Returns the absolute path to the initialized SQLite database.
     """
     db_path, legacy_txt = resolve_db_path(target)
     with _connect_db(db_path) as conn:
         conn.commit()
     if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+        _migrate_single_legacy_txt(db_path, legacy_txt, output_dir=output_dir)
+    if sync_disk:
+        sync_disk_to_db(target=target, output_dir=output_dir, announce=announce_sync)
     _logger().debug("Initialized SQLite state database at '%s'.", db_path)
     return db_path
 
 
+def _resolve_output_dir(target: Optional[Union[str, Dict]], db_path: str, output_dir: Optional[str] = None) -> str:
+    """Resolves the Today_Complaints directory path corresponding to target or db_path."""
+    if output_dir and str(output_dir).strip():
+        return os.path.abspath(str(output_dir).strip())
+    if isinstance(target, dict):
+        settings = target.get("settings", config_manager.DEFAULT_CONFIG["settings"])
+        return config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
+    db_parent = os.path.dirname(os.path.abspath(db_path))
+    if db_parent:
+        return os.path.join(db_parent, "Today_Complaints")
+    return config_manager.resolve_path("Today_Complaints")
+
+
 def _discover_existing_pdfs(output_dir: Optional[str]) -> Dict[str, Tuple[str, str]]:
     """
-    Scans Today_Complaints/ to map complaint_id -> (technician, abs_pdf_path)
-    so legacy completed_complaints.txt records receive accurate metadata during migration.
+    Scans Today_Complaints/ (excluding 'Manual_Batch') for valid numeric PDFs (^\\d+\\.pdf$)
+    with size > 0 bytes, mapping complaint_id -> (technician, abs_pdf_path).
+    If a complaint PDF exists in both 'All_PDFs'/root ('Unknown') and a named technician
+    folder, the named technician folder takes precedence.
     """
     mapping: Dict[str, Tuple[str, str]] = {}
     if not output_dir or not os.path.exists(output_dir):
         return mapping
 
     try:
-        for root, _, files in os.walk(output_dir):
-            for fname in files:
-                if fname.lower().endswith(".pdf") and not fname.startswith("._"):
-                    cid = os.path.splitext(fname)[0].strip()
-                    full_path = os.path.abspath(os.path.join(root, fname))
-                    tech = _infer_technician_from_path(full_path)
+        for root, dirs, files in os.walk(output_dir):
+            # Exclude Manual_Batch directory so manual one-off runs do not contaminate bulk state
+            dirs[:] = sorted(d for d in dirs if d.lower() != "manual_batch" and not d.startswith("."))
+            for fname in sorted(files):
+                if fname.startswith("._") or not re.fullmatch(r"\d+\.pdf", fname, flags=re.IGNORECASE):
+                    continue
+                full_path = os.path.abspath(os.path.join(root, fname))
+                try:
+                    if not os.path.isfile(full_path) or os.path.getsize(full_path) <= 0:
+                        continue
+                except OSError:
+                    continue
+
+                cid = os.path.splitext(fname)[0].strip()
+                tech = _infer_technician_from_path(full_path)
+                prev = mapping.get(cid)
+                if prev is None or (prev[0] == "Unknown" and tech != "Unknown"):
                     mapping[cid] = (tech, full_path)
     except Exception as e:
-        _logger().debug("Could not scan output_dir '%s' during migration: %s", output_dir, e)
+        _logger().debug("Could not scan output_dir '%s' during PDF discovery: %s", output_dir, e)
     return mapping
+
+
+def sync_disk_to_db(
+    target: Optional[Union[str, Dict]] = None,
+    output_dir: Optional[str] = None,
+    announce: bool = True,
+) -> int:
+    """
+    Idempotent Startup Disk-to-DB Sync:
+    Scans Today_Complaints/ (all technician subdirectories except 'Manual_Batch', plus root/All_PDFs)
+    for valid numeric PDFs (^\\d+\\.pdf$, size > 0 bytes) and registers any missing records in SQLite
+    with status='DOWNLOADED', technician=<folder>, and file_path=<resolved_pdf_path>.
+    Returns the number of newly synced PDF records inserted into the database.
+    """
+    db_path, legacy_txt = resolve_db_path(target)
+    resolved_output_dir = _resolve_output_dir(target, db_path, output_dir)
+
+    if legacy_txt and os.path.exists(legacy_txt):
+        _migrate_single_legacy_txt(db_path, legacy_txt, output_dir=resolved_output_dir)
+
+    pdf_map = _discover_existing_pdfs(resolved_output_dir)
+    if not pdf_map:
+        return 0
+
+    now = _now_str()
+    newly_synced = 0
+
+    try:
+        with _connect_db(db_path) as conn:
+            existing_rows = {
+                str(row["complaint_id"]).strip(): (
+                    str(row["technician"] or "Unknown"),
+                    str(row["file_path"] or ""),
+                )
+                for row in conn.execute("SELECT complaint_id, technician, file_path FROM complaints").fetchall()
+                if row["complaint_id"]
+            }
+
+            to_insert = []
+            to_update_meta = []
+            for cid, (tech, fpath) in pdf_map.items():
+                if cid not in existing_rows:
+                    to_insert.append((cid, tech, fpath, now, now))
+                else:
+                    curr_tech, curr_path = existing_rows[cid]
+                    new_tech = tech if (curr_tech == "Unknown" and tech != "Unknown") else curr_tech
+                    new_path = fpath if (not curr_path or not os.path.exists(curr_path)) else curr_path
+                    if new_tech != curr_tech or new_path != curr_path:
+                        to_update_meta.append((new_tech, new_path, cid))
+
+            if to_insert or to_update_meta:
+                with conn:
+                    if to_insert:
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO complaints
+                                (complaint_id, status, technician, file_path, printer_name, job_id, created_at, updated_at)
+                            VALUES (?, 'DOWNLOADED', ?, ?, '', NULL, ?, ?)
+                            """,
+                            to_insert,
+                        )
+                        newly_synced = len(to_insert)
+                    if to_update_meta:
+                        conn.executemany(
+                            """
+                            UPDATE complaints
+                            SET technician = ?, file_path = ?
+                            WHERE complaint_id = ?
+                            """,
+                            to_update_meta,
+                        )
+    except Exception as e:
+        _logger().error("[!] Error during Startup Disk-to-DB Sync on '%s': %s", db_path, e, exc_info=True)
+        return 0
+
+    if newly_synced > 0 and announce:
+        folder_label = os.path.basename(os.path.normpath(resolved_output_dir)) or "Today_Complaints"
+        _logger().info("[+] Synced %d existing PDFs from %s/ into database.", newly_synced, folder_label)
+
+    return newly_synced
 
 
 def _archive_migrated_txt(txt_path: str) -> Optional[str]:

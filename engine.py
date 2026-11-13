@@ -211,6 +211,20 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         logger.info("Process aborted by user (Esc pressed) before starting complaint #%s.", num)
         return False, "Process aborted by user (Esc pressed)."
 
+    # Runtime Defense-in-Depth: when progress tracking is enabled (Bulk Mode),
+    # if a valid non-empty PDF already exists on disk, backfill SQLite and skip ERP GUI download.
+    if record_progress:
+        existing_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+        if existing_pdf:
+            record_completed_complaint(db_path, num, technician=tech, file_path=existing_pdf)
+            logger.info(f"[>>] Existing PDF found on disk for #{num} ({tech}); synced to database and skipping ERP download.")
+            if live_print:
+                print_ok, print_msg = _dispatch_live_print(num, existing_pdf, config, timings)
+                if not print_ok:
+                    return False, print_msg
+                return True, f"{num} synced from disk and printed successfully."
+            return True, f"{num} already exists on disk (synced to database)."
+
     try:
         # Step A: Focus & Enter Complaint Number
         input_pt = coords.get("complaint_input", {"x": 118, "y": 160})
@@ -551,6 +565,33 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
                             break
                         stats["failed"] += 1
                     continue
+
+            # Runtime Defense-in-Depth: check if a valid non-empty PDF already exists on disk
+            # even if it was not yet registered in completed_set.
+            existing_disk_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+            if existing_disk_pdf:
+                record_completed_complaint(db_path, num, technician=tech, file_path=existing_disk_pdf)
+                completed_set.add(num)
+                if not live_print or num in printed_set:
+                    logger.info(
+                        f"[>>] [{idx}/{len(records)}] {num} already exists on disk (synced to DB). Skipping..."
+                    )
+                    stats["skipped"] += 1
+                    continue
+
+                logger.info(
+                    f"\n[->] [{idx}/{len(records)}] Existing PDF found on disk for #{num} (Tech: {tech}); synced to DB and printing..."
+                )
+                print_ok, print_msg = _dispatch_live_print(num, existing_disk_pdf, config, timings)
+                if print_ok:
+                    printed_set.add(num)
+                    stats["completed"] += 1
+                else:
+                    if "aborted" in print_msg.lower() or "failsafe" in print_msg.lower():
+                        stats["aborted"] = True
+                        break
+                    stats["failed"] += 1
+                continue
 
             logger.info(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
             success, msg = process_complaint(

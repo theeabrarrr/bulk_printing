@@ -118,9 +118,24 @@ def _restore_runtime_data(backup_dir, suite_dir, preserved_items):
         dst = os.path.join(suite_dir, item)
         if os.path.exists(src):
             if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+                for root, _, files in os.walk(src):
+                    rel_dir = os.path.relpath(root, src)
+                    target_dir = dst if rel_dir == "." else os.path.join(dst, rel_dir)
+                    os.makedirs(target_dir, exist_ok=True)
+                    for fname in files:
+                        s_file = os.path.join(root, fname)
+                        d_file = os.path.join(target_dir, fname)
+                        if not os.path.exists(d_file):
+                            try:
+                                shutil.copy2(s_file, d_file)
+                            except PermissionError:
+                                pass
             else:
-                shutil.copy2(src, dst)
+                if not os.path.exists(dst):
+                    try:
+                        shutil.copy2(src, dst)
+                    except PermissionError:
+                        pass
             print(f"  [*] Preserved existing runtime data: {dst}")
 
 
@@ -189,55 +204,73 @@ def build_executable():
 
     dist_root = os.path.join(PROJECT_DIR, "dist")
     suite_dir = os.path.join(dist_root, PACKAGE_NAME)
-    cmd = [
-        sys.executable,
-        "-m",
-        "PyInstaller",
-        "--noconfirm",
-        "--onedir",
-        "--console",
-        "--clean",
-        "--distpath", dist_root,
-        "--workpath", os.path.join(PROJECT_DIR, "build"),
-        "--specpath", PROJECT_DIR,
-        "--name",
-        PACKAGE_NAME,
-        "--collect-all", "pypdfium2",
-        "--hidden-import", "sqlite3",
-        "--hidden-import", "win32print",
-        "--hidden-import", "win32ui",
-        "--hidden-import", "win32con",
-        "--hidden-import", "win32gui",
-        "--hidden-import", "PIL.ImageWin",
-        # Exclude heavy unused libraries present in global Python to keep binary compact and fast
-        "--exclude-module", "matplotlib",
-        "--exclude-module", "scipy",
-        "--exclude-module", "sklearn",
-        "--exclude-module", "scikit-image",
-        "--exclude-module", "cv2",
-        "--exclude-module", "onnxruntime",
-        "--exclude-module", "streamlit",
-        "--exclude-module", "fastapi",
-        "--exclude-module", "flask",
-        "--exclude-module", "sqlalchemy",
-        "--exclude-module", "grpc",
-        "--exclude-module", "google",
-        "--exclude-module", "pyarrow",
-        "--exclude-module", "numba",
-        "--exclude-module", "llvmlite",
-        "--exclude-module", "jinja2",
-        "--exclude-module", "IPython",
-        "--exclude-module", "tornado",
-        ENTRY_SCRIPT,
-    ]
 
-    with tempfile.TemporaryDirectory() as backup_dir:
+    with tempfile.TemporaryDirectory() as temp_root:
+        backup_dir = os.path.join(temp_root, "backup")
+        stage_dist = os.path.join(temp_root, "stage_dist")
+        os.makedirs(backup_dir, exist_ok=True)
+        os.makedirs(stage_dist, exist_ok=True)
+
         preserved_items = _backup_runtime_data(suite_dir, backup_dir)
         if preserved_items:
             print(f"\n[*] Backed up {len(preserved_items)} runtime item(s) from '{suite_dir}': {', '.join(preserved_items)}")
 
+        cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--onedir",
+            "--console",
+            "--clean",
+            "--distpath", stage_dist,
+            "--workpath", os.path.join(PROJECT_DIR, "build"),
+            "--specpath", PROJECT_DIR,
+            "--name",
+            PACKAGE_NAME,
+            "--collect-all", "pypdfium2",
+            "--hidden-import", "sqlite3",
+            "--hidden-import", "win32print",
+            "--hidden-import", "win32ui",
+            "--hidden-import", "win32con",
+            "--hidden-import", "win32gui",
+            "--hidden-import", "PIL.ImageWin",
+            # Exclude heavy unused libraries present in global Python to keep binary compact and fast
+            "--exclude-module", "matplotlib",
+            "--exclude-module", "scipy",
+            "--exclude-module", "sklearn",
+            "--exclude-module", "scikit-image",
+            "--exclude-module", "cv2",
+            "--exclude-module", "onnxruntime",
+            "--exclude-module", "streamlit",
+            "--exclude-module", "fastapi",
+            "--exclude-module", "flask",
+            "--exclude-module", "sqlalchemy",
+            "--exclude-module", "grpc",
+            "--exclude-module", "google",
+            "--exclude-module", "pyarrow",
+            "--exclude-module", "numba",
+            "--exclude-module", "llvmlite",
+            "--exclude-module", "jinja2",
+            "--exclude-module", "IPython",
+            "--exclude-module", "tornado",
+            ENTRY_SCRIPT,
+        ]
+
         print(f"\nRunning command:\n  {' '.join(cmd)}\n")
         result = subprocess.run(cmd, cwd=PROJECT_DIR)
+
+        if result.returncode == 0:
+            staged_suite = os.path.join(stage_dist, PACKAGE_NAME)
+            os.makedirs(suite_dir, exist_ok=True)
+            _terminate_running_suite_processes(suite_dir)
+            for item in os.listdir(staged_suite):
+                s_item = os.path.join(staged_suite, item)
+                d_item = os.path.join(suite_dir, item)
+                if os.path.isdir(s_item):
+                    shutil.copytree(s_item, d_item, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(s_item, d_item)
 
         if preserved_items:
             _restore_runtime_data(backup_dir, suite_dir, preserved_items)
@@ -268,12 +301,12 @@ def build_executable():
         os.makedirs(dest_logs, exist_ok=True)
         print(f"  [+] Initialized rotating logs directory: {dest_logs}")
 
-        # Initialize SQLite state database and migrate any legacy .txt files in suite_dir
+        # Initialize SQLite state database, migrate any legacy .txt files, and sync Today_Complaints/ in suite_dir
         dest_db = os.path.join(suite_dir, "complaints_state.db")
-        state_manager.init_db(dest_db)
         dest_completed_txt = os.path.join(suite_dir, "completed_complaints.txt")
         dest_printed_txt = os.path.join(suite_dir, "printed_complaints.txt")
         dest_out_dir = os.path.join(suite_dir, "Today_Complaints")
+        state_manager.init_db(dest_db, output_dir=dest_out_dir, sync_disk=False)
         if os.path.exists(dest_completed_txt) or os.path.exists(dest_printed_txt):
             state_manager.migrate_legacy_txt_files(
                 db_path=dest_db,
@@ -282,6 +315,7 @@ def build_executable():
                 output_dir=dest_out_dir,
                 archive_after_migrate=True,
             )
+        state_manager.sync_disk_to_db(dest_db, output_dir=dest_out_dir, announce=True)
         print(f"  [+] Initialized SQLite state database: {dest_db}")
 
         print("\n" + "=" * 60)

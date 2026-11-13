@@ -25,8 +25,9 @@ logger = logger_manager.get_logger("main")
 def ensure_runtime_files(config):
     """
     Ensures output directory, centralized rotating log directory, and the SQLite
-    state database ('complaints_state.db') exist, and automatically migrates any
-    legacy flat-file trackers ('completed_complaints.txt', 'printed_complaints.txt').
+    state database ('complaints_state.db') exist, migrates any legacy flat-file
+    trackers ('completed_complaints.txt', 'printed_complaints.txt'), and executes
+    the idempotent Startup Disk-to-DB Sync against Today_Complaints/.
     """
     logger_manager.setup_logging(config)
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
@@ -38,7 +39,7 @@ def ensure_runtime_files(config):
     printed_file = config_manager.resolve_path(printing_cfg.get("printed_tracker_file", "printed_complaints.txt"))
 
     os.makedirs(output_dir, exist_ok=True)
-    state_manager.init_db(db_path)
+    state_manager.init_db(db_path, output_dir=output_dir, sync_disk=False)
 
     if os.path.exists(progress_file) or os.path.exists(printed_file):
         try:
@@ -51,6 +52,8 @@ def ensure_runtime_files(config):
             )
         except Exception as e:
             logger.error(f"[!] Warning: Legacy tracker file migration encountered an error: {e}", exc_info=True)
+
+    state_manager.sync_disk_to_db(db_path, output_dir=output_dir, announce=True)
 
 
 def _select_validated_physical_printer(config, initial_printer=None, force_prompt=True):
