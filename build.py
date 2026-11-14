@@ -1,8 +1,13 @@
+import argparse
+import hashlib
 import os
 import sys
 import shutil
 import subprocess
 import tempfile
+import zipfile
+
+import version
 
 try:
     import config_manager
@@ -16,8 +21,8 @@ except ImportError as e:
 
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-PACKAGE_NAME = "ERP_Automation_Suite"
-EXE_NAME = "ERP_Automation_Suite"
+PACKAGE_NAME = version.APP_NAME
+EXE_NAME = version.EXE_NAME
 ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
 RUNTIME_PRESERVE_ITEMS = [
     "config.json",
@@ -148,6 +153,7 @@ def _terminate_running_suite_processes(suite_dir=None):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=5,
             )
         except Exception:
             pass
@@ -292,10 +298,129 @@ def _cleanup_build_artifacts(root_logs_existed, preexisting_log_entries):
         print(f"  [!] Notice: Could not remove temporary build artifacts: {cleanup_err}")
 
 
-def build_executable():
-    """Runs PyInstaller to package main.py into a standalone --onedir suite."""
+def create_release_archive(suite_dir, dist_root, ver=None):
+    """
+    Packages ONLY the application binaries (ERP_Automation_Suite.exe and _internal/)
+    into dist/ERP_Automation_Suite_vX.Y.Z.zip and writes its SHA-256 sidecar file
+    dist/ERP_Automation_Suite_vX.Y.Z.zip.sha256.
+    Strictly excludes runtime data (config.json, complaints.xlsx, complaints_state.db,
+    Today_Complaints/, logs/, etc.).
+    """
+    if ver is None:
+        ver = version.__version__
+    norm_ver = version.normalize_version_string(ver)
+    zip_filename = version.get_release_zip_name(norm_ver)
+    sha256_filename = version.get_release_sha256_name(norm_ver)
+    zip_path = os.path.join(dist_root, zip_filename)
+    sha256_path = os.path.join(dist_root, sha256_filename)
+
+    exe_file = os.path.join(suite_dir, f"{EXE_NAME}.exe")
+    internal_dir = os.path.join(suite_dir, "_internal")
+    if not os.path.isfile(exe_file) or not os.path.isdir(internal_dir):
+        raise FileNotFoundError(
+            f"Cannot create release archive: missing '{exe_file}' or '{internal_dir}'."
+        )
+
+    os.makedirs(dist_root, exist_ok=True)
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    print(f"\n[*] Creating clean release archive: {zip_path} ...")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # 1. Add ERP_Automation_Suite.exe under top-level ERP_Automation_Suite/ folder
+        zf.write(exe_file, os.path.join(PACKAGE_NAME, f"{EXE_NAME}.exe"))
+
+        # 2. Add _internal/ directory tree recursively
+        for root, _, files in os.walk(internal_dir):
+            for fname in sorted(files):
+                full_p = os.path.join(root, fname)
+                rel_p = os.path.relpath(full_p, suite_dir)
+                arcname = os.path.join(PACKAGE_NAME, rel_p)
+                zf.write(full_p, arcname)
+
+    # Compute SHA-256 checksum
+    hasher = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    sha256_hex = hasher.hexdigest().lower()
+
+    with open(sha256_path, "w", encoding="utf-8", newline="\n") as sf:
+        sf.write(f"{sha256_hex}  {zip_filename}\n")
+
+    zip_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"  [+] Release ZIP created : {zip_path} ({zip_mb:.2f} MB)")
+    print(f"  [+] SHA-256 Checksum    : {sha256_hex}")
+    print(f"  [+] SHA-256 Sidecar     : {sha256_path}")
+    return zip_path, sha256_path, sha256_hex
+
+
+def publish_github_release(zip_path, sha256_path, sha256_hex, ver=None, notes=None):
+    """
+    Publishes or updates the GitHub Release vX.Y.Z using the GitHub CLI (gh).
+    """
+    if ver is None:
+        ver = version.__version__
+    norm_ver = version.normalize_version_string(ver)
+    tag = f"v{norm_ver}"
+    repo = version.GITHUB_REPO
+
+    if not shutil.which("gh"):
+        print("\n[!] GitHub CLI ('gh') is not installed or not on PATH.")
+        print("    Install it from https://cli.github.com/ or upload the release manually:")
+        print(f"    1. Asset: {zip_path}")
+        print(f"    2. Asset: {sha256_path}")
+        return False
+
+    release_title = f"{PACKAGE_NAME} {tag}"
+    default_body = (
+        f"Automated release of **{PACKAGE_NAME} {tag}**.\n\n"
+        f"### Integrity Checksum (SHA-256)\n"
+        f"```\n{sha256_hex}  {os.path.basename(zip_path)}\n```"
+    )
+    body_text = f"{notes.strip()}\n\n{default_body}" if notes and notes.strip() else default_body
+
+    print(f"\n[*] Publishing GitHub Release {tag} to {repo}...")
+    view_res = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", repo],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if view_res.returncode == 0:
+        print(f"  [*] Release {tag} already exists; uploading updated assets (--clobber)...")
+        cmd = ["gh", "release", "upload", tag, zip_path, sha256_path, "--clobber", "--repo", repo]
+    else:
+        cmd = [
+            "gh",
+            "release",
+            "create",
+            tag,
+            zip_path,
+            sha256_path,
+            "--repo",
+            repo,
+            "--title",
+            release_title,
+            "--notes",
+            body_text,
+        ]
+
+    res = subprocess.run(cmd, cwd=PROJECT_DIR, check=False)
+    if res.returncode == 0:
+        print(f"  [+] Successfully published release {tag} to https://github.com/{repo}/releases/tag/{tag}")
+        return True
+    print(f"  [!] 'gh release' exited with code {res.returncode}.")
+    return False
+
+
+def build_executable(publish=False, release_notes=None):
+    """Runs PyInstaller to package main.py into a standalone --onedir suite and builds the release ZIP."""
     print("=" * 60)
-    print(f"  BUILDING ONEDIR SUITE: {PACKAGE_NAME} ({EXE_NAME}.exe)")
+    print(f"  BUILDING ONEDIR SUITE: {PACKAGE_NAME} v{version.__version__} ({EXE_NAME}.exe)")
     print("=" * 60)
 
     root_logs_dir = os.path.join(PROJECT_DIR, "logs")
@@ -319,10 +444,14 @@ def build_executable():
     with tempfile.TemporaryDirectory() as temp_root:
         backup_dir = os.path.join(temp_root, "backup")
         stage_dist = os.path.join(temp_root, "stage_dist")
+        work_dir = os.path.join(temp_root, "build_work")
+        spec_dir = os.path.join(temp_root, "spec")
         rollback_dir = os.path.join(temp_root, "rollback")
         build_logs_dir = os.path.join(temp_root, "build_logs")
         os.makedirs(backup_dir, exist_ok=True)
         os.makedirs(stage_dist, exist_ok=True)
+        os.makedirs(work_dir, exist_ok=True)
+        os.makedirs(spec_dir, exist_ok=True)
         os.makedirs(rollback_dir, exist_ok=True)
         os.makedirs(build_logs_dir, exist_ok=True)
 
@@ -348,8 +477,8 @@ def build_executable():
             "--console",
             "--clean",
             "--distpath", stage_dist,
-            "--workpath", os.path.join(PROJECT_DIR, "build"),
-            "--specpath", PROJECT_DIR,
+            "--workpath", work_dir,
+            "--specpath", spec_dir,
             "--name",
             PACKAGE_NAME,
             "--collect-all", "pypdfium2",
@@ -457,13 +586,34 @@ def build_executable():
 
     exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
     if os.path.exists(exe_path):
+        zip_path, sha256_path, sha256_hex = create_release_archive(
+            suite_dir=suite_dir,
+            dist_root=dist_root,
+            ver=version.__version__,
+        )
+
         print("\n" + "=" * 60)
-        print("  BUILD SUCCESSFUL!")
-        print(f"  Distribution Suite: {suite_dir}")
+        print(f"  BUILD SUCCESSFUL! (v{version.__version__})")
+        print(f"  Distribution Suite : {suite_dir}")
         print(f"  Executable Location: {exe_path}")
+        print(f"  Release ZIP Asset  : {zip_path}")
+        print(f"  Release SHA-256    : {sha256_hex}")
         print("=" * 60)
 
         _cleanup_build_artifacts(root_logs_existed, preexisting_log_entries)
+
+        if publish:
+            publish_github_release(
+                zip_path=zip_path,
+                sha256_path=sha256_path,
+                sha256_hex=sha256_hex,
+                ver=version.__version__,
+                notes=release_notes,
+            )
+        else:
+            print(
+                f"\n  [i] Tip: Run `python -B build.py --publish` to publish Release v{version.__version__} directly to GitHub."
+            )
         return True
 
     print(f"\n[!] Build completed but executable was not found at {exe_path}.")
@@ -471,5 +621,20 @@ def build_executable():
 
 
 if __name__ == "__main__":
-    success = build_executable()
+    parser = argparse.ArgumentParser(
+        description=f"Build {PACKAGE_NAME} (--onedir) and generate GitHub Release assets."
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Automatically create/upload the GitHub Release via 'gh release'.",
+    )
+    parser.add_argument(
+        "--notes",
+        type=str,
+        default=None,
+        help="Optional release notes to include when using --publish.",
+    )
+    args = parser.parse_args()
+    success = build_executable(publish=args.publish, release_notes=args.notes)
     sys.exit(0 if success else 1)

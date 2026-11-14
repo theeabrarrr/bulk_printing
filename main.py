@@ -18,6 +18,8 @@ import state_manager
 import calibration_wizard
 import engine
 import printer_manager
+import version
+import updater
 
 logger = logger_manager.get_logger("main")
 
@@ -1006,7 +1008,7 @@ def main():
     logger_manager.setup_logging()
 
     print("\n" + "=" * 60)
-    print("      ORACLE ERP AUTOMATION SUITE (v6.0)")
+    print(f"      ORACLE ERP AUTOMATION SUITE (v{version.__version__})")
     print("=" * 60)
 
     config_path = config_manager.get_config_path()
@@ -1034,6 +1036,7 @@ def main():
             return
 
     ensure_runtime_files(config)
+    updater.run_startup_update_check(config)
 
     while True:
         # Reload config on each menu cycle in case recalibration occurred
@@ -1066,7 +1069,7 @@ def main():
         fb_note = " (Auto-Detected)" if is_fb else ""
 
         print("\n" + "=" * 60)
-        print(" MAIN MENU")
+        print(f" MAIN MENU (v{version.__version__})")
         print(f" Target Printer: {configured_p or 'None'}{p_badge}{fb_note}")
         print("=" * 60)
         print("  [1] Bulk Mode (Process complaints.xlsx)")
@@ -1075,10 +1078,11 @@ def main():
         print("  [4] Generate OTP (Interactive Mode)")
         print("  [5] Batch Print Offline PDFs (Today_Complaints)")
         print("  [6] Select / Change Target Printer")
+        print(f"  [U] Check for Updates (Current: v{version.__version__})")
         print("  [7] Exit")
         print("=" * 60)
 
-        choice = input("Select an option [1-7]: ").strip()
+        choice = input("Select an option [1-7, U]: ").strip()
 
         if choice == "1":
             run_bulk_mode(config)
@@ -1098,11 +1102,16 @@ def main():
                 printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
             except KeyboardInterrupt:
                 logger.warning("\n[!] Printer selection cancelled.")
+        elif choice.lower() in ["u", "update"]:
+            try:
+                updater.run_interactive_update_check(config)
+            except KeyboardInterrupt:
+                logger.warning("\n[!] Update check cancelled.")
         elif choice == "7" or choice.lower() in ["exit", "q", "quit"]:
             logger.info("\nExiting ERP Automation Suite. Goodbye!")
             break
         else:
-            logger.warning("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, 6, or 7.")
+            logger.warning("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, or U.")
 
 
 if __name__ == "__main__":

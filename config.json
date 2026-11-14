@@ -51,5 +51,11 @@
     "backup_count": 5,
     "file_level": "DEBUG",
     "console_level": "INFO"
+  },
+  "updater": {
+    "github_repo": "theeabrarrr/bulk_printing",
+    "check_on_startup": true,
+    "startup_timeout_seconds": 3.0,
+    "download_timeout_seconds": 60.0
   }
 }

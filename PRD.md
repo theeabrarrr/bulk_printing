@@ -164,6 +164,12 @@ flowchart TD
     "backup_count": 5,
     "file_level": "DEBUG",
     "console_level": "INFO"
+  },
+  "updater": {
+    "github_repo": "theeabrarrr/bulk_printing",
+    "check_on_startup": true,
+    "startup_timeout_seconds": 3.0,
+    "download_timeout_seconds": 60.0
   }
 }
 ```
@@ -182,3 +188,4 @@ flowchart TD
 | **6.3** | **Core Engine & Spooler Integration** | **COMPLETED** | Integrate `state_manager` and `logger_manager` across `engine.py`, `printer_manager.py`, and `calibration_wizard.py`. |
 | **6.4** | **Strict Excel Input Validation** | **COMPLETED** | Implement header normalization, numeric ID validation, deduplication, and Pre-Flight Validation Summary in `main.py`. |
 | **6.5** | **Packaging & Documentation** | **COMPLETED** | Update `build.py` runtime preservation for SQLite/logs and synchronize `PRD.md` & `README.md`. |
+| **Phase 7** | **In-App Self-Updater (`updater.py`, `version.py`)** | **COMPLETED** | GitHub Releases API polling, SHA-256 verification, detached `.bat` swap with rollback protection, `[U]` CLI menu, and `build.py` release ZIP automation. |

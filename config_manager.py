@@ -57,6 +57,12 @@ DEFAULT_CONFIG = {
         "backup_count": 5,
         "file_level": "DEBUG",
         "console_level": "INFO"
+    },
+    "updater": {
+        "github_repo": "theeabrarrr/bulk_printing",
+        "check_on_startup": True,
+        "startup_timeout_seconds": 3.0,
+        "download_timeout_seconds": 60.0
     }
 }
 
@@ -289,6 +295,38 @@ def get_logging_settings(config=None):
     merged["log_file"] = str(merged.get("log_file") or "app.log").strip()
     merged["file_level"] = str(merged.get("file_level") or "DEBUG").strip().upper()
     merged["console_level"] = str(merged.get("console_level") or "INFO").strip().upper()
+    return merged
+
+def get_updater_settings(config=None):
+    """
+    Returns the updater configuration dictionary, ensuring default fallbacks and type safety.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    updater_cfg = config.get("updater", {}) if isinstance(config, dict) else {}
+    if not isinstance(updater_cfg, dict):
+        updater_cfg = {}
+    default_updater = DEFAULT_CONFIG["updater"]
+
+    merged = {}
+    for k, v in default_updater.items():
+        merged[k] = updater_cfg.get(k, v)
+
+    repo = str(merged.get("github_repo") or default_updater["github_repo"]).strip()
+    merged["github_repo"] = repo if "/" in repo else default_updater["github_repo"]
+    merged["check_on_startup"] = bool(merged.get("check_on_startup", True))
+
+    try:
+        merged["startup_timeout_seconds"] = max(0.5, float(merged.get("startup_timeout_seconds", 3.0)))
+    except (ValueError, TypeError):
+        merged["startup_timeout_seconds"] = 3.0
+
+    try:
+        merged["download_timeout_seconds"] = max(5.0, float(merged.get("download_timeout_seconds", 60.0)))
+    except (ValueError, TypeError):
+        merged["download_timeout_seconds"] = 60.0
+
     return merged
 
 def get_configured_printer(config=None):

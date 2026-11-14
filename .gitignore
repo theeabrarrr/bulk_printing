@@ -16,3 +16,9 @@ logs/
 *.bak
 completed_complaints.txt
 printed_complaints.txt
+_update_staging/
+_update_rollback/
+_run_update.bat
+
+# Local CLI prompt scratchpad
+context/

@@ -1,8 +1,11 @@
-# Oracle ERP Automation Suite (v6.0: Enterprise SQLite State, Logging & Silent Printing)
+# Oracle ERP Automation Suite (v6.1.0: In-App Self-Updater, Enterprise SQLite State, Logging & Silent Printing)
 
-An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), performs **Universal Silent Physical Printing**, and automates single-complaint **OTP Generation**.
+An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
 
-## Key Enterprise Features (v6.0)
+## Key Enterprise Features (v6.1.0)
+- **In-App Self-Updater & Atomic Binary Swap (`updater.py`, `version.py`)**:
+  - Performs a fast (3-second timeout) non-blocking update check against GitHub Releases on startup and offers an on-demand **`[U] Check for Updates`** menu option.
+  - Downloads release archives (`ERP_Automation_Suite_vX.Y.Z.zip`), verifies SHA-256 checksum integrity, and spawns a detached Windows helper (`_run_update.bat`) that waits for the active process to exit (`tasklist`), atomically replaces `ERP_Automation_Suite.exe` and `_internal/` with rollback protection, and restarts automatically while strictly preserving `config.json`, `complaints_state.db`, `complaints.xlsx`, `Today_Complaints/`, and `logs/`.
 - **ACID-Compliant SQLite State Management (`complaints_state.db`)**:
   - Replaces legacy flat-file trackers with a crash-safe SQLite database operating in Write-Ahead Logging (`WAL`) mode.
   - Tracks each complaint across progressive states (`DOWNLOADED`, `SPOOLED`, `PRINTED`, `PRINT_FAILED`) alongside technician name, PDF path, printer name, spooler job ID, and timestamps.
@@ -40,6 +43,7 @@ Ensure the following items are in the `ERP_Automation_Suite` folder:
    - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint numbers and automates OTP generation in Oracle Forms in a continuous loop.
    - **`[5] Batch Print Offline PDFs (Today_Complaints)`**: Lists Technician folders inside `Today_Complaints/` with `[Total | Printed | Pending]` counts backed by `complaints_state.db`, lets you pick one or more folders (or all), and silent-prints unprinted documents using a progress-aware sliding-window spooler pipeline.
    - **`[6] Select / Change Target Printer`**: Lists installed Windows printers and updates the configured target printer in `config.json`.
+   - **`[U] Check for Updates`**: Checks GitHub Releases for a newer version and performs a verified, state-preserving in-place update and restart.
    - **`[7] Exit`**: Closes the program.
 
 ---
@@ -74,21 +78,25 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Building the Standalone Executable (`ERP_Automation_Suite.exe`)
+### Building the Standalone Executable (`ERP_Automation_Suite.exe`) & Release Asset
 ```bash
-python build.py
+python -B build.py
+# Or build and automatically publish the GitHub Release via GitHub CLI:
+python -B build.py --publish
 ```
-This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` while preserving existing `config.json`, `complaints.xlsx`, `complaints_state.db`, `logs/`, and `Today_Complaints/`.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` while preserving existing `config.json`, `complaints.xlsx`, `complaints_state.db`, `logs/`, and `Today_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.1.0.zip` + `.sha256` checksum.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
-| `main.py` | Entry point, CLI menu router (`[1]`–`[7]`), strict Excel validation & Pre-Flight Summary, and Batch Print mode `[5]`. |
+| `main.py` | Entry point, CLI menu router (`[1]`–`[7]`, `[U]`), strict Excel validation & Pre-Flight Summary, and Batch Print mode `[5]`. |
+| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.1.0"`), SemVer comparisons, and release asset naming. |
+| `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper. |
 | `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, and legacy `.txt` auto-migrator. |
 | `logger_manager.py` | Centralized logging manager with `RotatingFileHandler` (`logs/app.log`, 5 MB x 5 backups), console stream formatting, and crash hook. |
 | `printer_manager.py` | Modular printing engine: printer enumeration, spooler queue monitoring, queue gate failsafe, headless GDI printing, and job reconciliation. |
 | `config_manager.py` | Portable path anchoring (`sys.executable`), Per-Monitor DPI awareness, and unified schema validation. |
 | `calibration_wizard.py` | Guided wizard for coordinate capture (Space/F8) and physical printer configuration. |
 | `engine.py` | Unified RPA loop for PDF generation, Live Print dispatch & focus restoration, and isolated `generate_otp()` sequence. |
-| `build.py` | PyInstaller build script compiling standalone `--onedir` distribution to `dist/ERP_Automation_Suite/`. |
+| `build.py` | PyInstaller build script compiling standalone `--onedir` distribution, release `.zip` + `.sha256`, and optional `--publish` release automation. |
 | `legacy/masterbot.py` | Original Phase 2 baseline script (archived & preserved untouched). |
