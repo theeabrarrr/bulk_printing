@@ -93,16 +93,49 @@ def resolve_path(relative_or_absolute_path):
 
 def get_database_path(config=None):
     """Returns the resolved absolute path to the SQLite state database file."""
+    explicit_cfg = config if isinstance(config, dict) else None
     if config is None:
         try:
             config = load_config() or DEFAULT_CONFIG
         except Exception:
             config = DEFAULT_CONFIG
-    settings = config.get("settings", DEFAULT_CONFIG["settings"])
-    db_rel = settings.get("database_file", DEFAULT_CONFIG["settings"]["database_file"])
+    settings = config.get("settings", DEFAULT_CONFIG["settings"]) if isinstance(config, dict) else DEFAULT_CONFIG["settings"]
+    default_db_name = DEFAULT_CONFIG["settings"]["database_file"]
+
+    has_explicit_db = (
+        explicit_cfg is not None
+        and isinstance(explicit_cfg.get("settings"), dict)
+        and bool(str(explicit_cfg["settings"].get("database_file") or "").strip())
+    )
+    if not has_explicit_db and explicit_cfg is not None:
+        # If caller supplied a partial config with a custom legacy tracker path but no database_file,
+        # anchor complaints_state.db in that tracker's directory.
+        raw_progress = (
+            explicit_cfg.get("settings", {}).get("progress_file")
+            if isinstance(explicit_cfg.get("settings"), dict)
+            else None
+        )
+        raw_printed = (
+            explicit_cfg.get("printing", {}).get("printed_tracker_file")
+            if isinstance(explicit_cfg.get("printing"), dict)
+            else None
+        )
+        for legacy_candidate in (raw_printed, raw_progress):
+            if legacy_candidate and str(legacy_candidate).strip():
+                resolved_legacy = resolve_path(str(legacy_candidate).strip())
+                if resolved_legacy.lower().endswith((".db", ".sqlite", ".sqlite3")):
+                    return resolved_legacy
+                candidate_dir = os.path.dirname(os.path.abspath(resolved_legacy))
+                if candidate_dir and os.path.normcase(candidate_dir) != os.path.normcase(os.path.abspath(get_base_dir())):
+                    return os.path.join(candidate_dir, default_db_name)
+
+    db_rel = settings.get("database_file", default_db_name)
     if not db_rel or not str(db_rel).strip():
-        db_rel = DEFAULT_CONFIG["settings"]["database_file"]
-    return resolve_path(str(db_rel).strip())
+        db_rel = default_db_name
+    resolved_db = resolve_path(str(db_rel).strip())
+    if resolved_db.lower().endswith(".txt"):
+        return os.path.join(os.path.dirname(os.path.abspath(resolved_db)), default_db_name)
+    return resolved_db
 
 def load_config(config_path=None):
     """

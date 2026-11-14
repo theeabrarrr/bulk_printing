@@ -116,7 +116,7 @@ def _dispatch_live_print(num, file_path, config, timings):
 
     printing_cfg = config_manager.get_printing_settings(config)
     target_printer, is_fallback = config_manager.get_configured_printer(config)
-    db_path = config_manager.get_database_path(config)
+    db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed")
     max_queue = printing_cfg.get("max_spool_queue", 3)
 
     if not target_printer:
@@ -204,7 +204,7 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
         logger.error(f"\n[!] Failed to create destination folder '{dest_folder}': {e}", exc_info=True)
         return False, f"Destination folder creation failed: {e}"
 
-    db_path = config_manager.get_database_path(config)
+    db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="completed", output_dir=output_base)
 
     # Early abort check
     if check_abort():
@@ -499,7 +499,7 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
     timings = config.get("timings", config_manager.DEFAULT_CONFIG["timings"])
     output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-    db_path = config_manager.get_database_path(config)
+    db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="completed", output_dir=output_base)
     completed_set = get_completed_complaints(db_path)
 
     printed_set = set()

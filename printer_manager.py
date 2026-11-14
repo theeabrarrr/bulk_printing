@@ -22,6 +22,10 @@ if sys.platform == "win32":
     import win32ui
     import win32con
     import win32gui
+    try:
+        import win32timezone  # noqa: F401
+    except Exception:
+        win32timezone = None
     from PIL import Image, ImageWin
     import pypdfium2 as pdfium
 else:
@@ -29,6 +33,7 @@ else:
     win32ui = None
     win32con = None
     win32gui = None
+    win32timezone = None
     ImageWin = None
     pdfium = None
 
@@ -761,6 +766,8 @@ def reconcile_in_flight_jobs(
     if status is None:
         status = get_queue_status(printer_name)
 
+    resolved_tracker = _resolve_tracker_db_path(tracker_file)
+
     confirmed_now = 0
     failed_now: List[Tuple[str, str]] = []
     remaining: List[Dict[str, Any]] = []
@@ -774,7 +781,7 @@ def reconcile_in_flight_jobs(
         state, reason = inspect_job_in_status(status, job_id=j_id, doc_name=d_name)
         if state == "CONFIRMED":
             if not mark_complaint_printed(
-                tracker_file, c_num, p_path, printer_name, job_id=j_id
+                resolved_tracker, c_num, p_path, printer_name, job_id=j_id
             ):
                 raise RuntimeError(f"Failed to record confirmed print for #{c_num} in state database.")
             confirmed_now += 1
@@ -782,7 +789,7 @@ def reconcile_in_flight_jobs(
         elif state == "FAILED":
             try:
                 state_manager.mark_complaint_print_failed(
-                    tracker_file, c_num, file_path=p_path, printer_name=printer_name, job_id=j_id, reason=reason
+                    resolved_tracker, c_num, file_path=p_path, printer_name=printer_name, job_id=j_id, reason=reason
                 )
             except Exception as err:
                 logger.debug("Could not mark PRINT_FAILED for #%s: %s", c_num, err)
@@ -818,6 +825,8 @@ def drain_in_flight_jobs(
     if not in_flight:
         return 0, [], False
 
+    resolved_tracker = _resolve_tracker_db_path(tracker_file)
+
     logger.info(f"\n[*] Waiting for {len(in_flight)} remaining spooled job(s) to finish printing on '{printer_name}'...")
     stall_start = time.time()
     last_sig = None
@@ -832,7 +841,7 @@ def drain_in_flight_jobs(
 
         # If there is no hardware error, reconcile any jobs that finished
         if not has_error:
-            c_now, f_now = reconcile_in_flight_jobs(printer_name, in_flight, tracker_file, status=status)
+            c_now, f_now = reconcile_in_flight_jobs(printer_name, in_flight, resolved_tracker, status=status)
             total_confirmed += c_now
             total_failed.extend(f_now)
             if not in_flight:
@@ -870,7 +879,7 @@ def drain_in_flight_jobs(
                     c_num = item["complaint_no"]
                     try:
                         state_manager.mark_complaint_print_failed(
-                            tracker_file,
+                            resolved_tracker,
                             c_num,
                             file_path=item.get("file_path", ""),
                             printer_name=printer_name,
@@ -897,6 +906,15 @@ _ORIG_GET_QUEUE_STATUS = get_queue_status
 _ORIG_PRINT_PDF_SILENT = print_pdf_silent
 
 
+def _resolve_tracker_db_path(tracker_path: Optional[Union[str, Dict]] = None) -> str:
+    """
+    Resolves a database path, legacy .txt print tracker path, config dict, or None
+    into the migrated SQLite state database path before tracker operations open it.
+    Preserves existing behavior for database paths.
+    """
+    return state_manager.ensure_tracker_db_ready(tracker_path, tracker_kind="printed")
+
+
 def mark_complaint_spooled(
     tracker_path: Optional[Union[str, Dict]],
     complaint_no: str,
@@ -908,8 +926,9 @@ def mark_complaint_spooled(
     Records a complaint print job as SPOOLED (not yet confirmed printed) in the SQLite state database.
     Propagates write/sync failures by raising an exception.
     """
+    db_path = _resolve_tracker_db_path(tracker_path)
     return state_manager.mark_complaint_spooled(
-        tracker_path,
+        db_path,
         complaint_no,
         file_path=file_path,
         printer_name=printer_name,
@@ -929,8 +948,9 @@ def mark_complaint_printed(
     Atomically records a complaint as confirmed PRINTED in the SQLite state database.
     Propagates database failures by raising an exception.
     """
+    db_path = _resolve_tracker_db_path(tracker_path)
     return state_manager.mark_complaint_printed(
-        tracker_path,
+        db_path,
         complaint_no,
         file_path=file_path,
         printer_name=printer_name,
@@ -946,7 +966,8 @@ def load_printed_complaints(tracker_path: Optional[Union[str, Dict]] = None) -> 
     so they remain eligible for retry.
     Propagates database errors to the caller rather than returning an empty or partial set.
     """
-    return state_manager.load_printed_complaints(tracker_path)
+    db_path = _resolve_tracker_db_path(tracker_path)
+    return state_manager.load_printed_complaints(db_path)
 
 
 def reset_printed_tracker_safe(tracker_path: Optional[Union[str, Dict]] = None) -> Optional[str]:
@@ -955,4 +976,5 @@ def reset_printed_tracker_safe(tracker_path: Optional[Union[str, Dict]] = None) 
     and downgrades all SPOOLED/PRINTED/PRINT_FAILED states back to DOWNLOADED.
     Preserves ERP download records so Mode [1] never re-downloads existing PDFs.
     """
-    return state_manager.reset_printed_tracker_safe(tracker_path)
+    db_path = _resolve_tracker_db_path(tracker_path)
+    return state_manager.reset_printed_tracker_safe(db_path)

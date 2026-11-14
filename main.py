@@ -644,7 +644,7 @@ def run_batch_print_mode(config):
             is_fallback = False
 
         output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-        db_path = config_manager.get_database_path(config)
+        db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed", output_dir=output_dir)
         max_queue = printing_settings.get("max_spool_queue", 3)
 
         if not os.path.exists(output_dir):

@@ -140,7 +140,7 @@ def _restore_runtime_data(backup_dir, suite_dir, preserved_items):
 
 
 def _terminate_running_suite_processes(suite_dir=None):
-    """Terminates any running ERP_Automation_Suite.exe processes and evacuates locked DLLs so PyInstaller can rebuild cleanly."""
+    """Terminates any running ERP_Automation_Suite.exe processes without deleting installed application files."""
     if sys.platform == "win32":
         try:
             subprocess.run(
@@ -152,38 +152,144 @@ def _terminate_running_suite_processes(suite_dir=None):
         except Exception:
             pass
 
-    if suite_dir and os.path.exists(suite_dir):
-        for target in (os.path.join(suite_dir, f"{EXE_NAME}.exe"), os.path.join(suite_dir, "_internal")):
-            if not os.path.exists(target):
-                continue
-            if os.path.isfile(target):
+
+def _remove_suite_target(target):
+    """Removes an application file or directory tree from suite_dir, evacuating locked files if necessary."""
+    if not target or not os.path.exists(target):
+        return
+    if os.path.isfile(target) or os.path.islink(target):
+        try:
+            os.remove(target)
+        except PermissionError:
+            try:
+                shutil.move(target, tempfile.mktemp(prefix="old_exe_"))
+            except Exception as e:
+                raise OSError(f"Could not remove locked file '{target}': {e}") from e
+    else:
+        for root, dirs, files in os.walk(target, topdown=False):
+            for f in files:
+                fp = os.path.join(root, f)
                 try:
-                    os.remove(target)
+                    os.remove(fp)
                 except PermissionError:
                     try:
-                        shutil.move(target, tempfile.mktemp(prefix="old_exe_"))
-                    except Exception:
-                        pass
-            else:
-                for root, dirs, files in os.walk(target, topdown=False):
-                    for f in files:
-                        fp = os.path.join(root, f)
-                        try:
-                            os.remove(fp)
-                        except PermissionError:
-                            try:
-                                shutil.move(fp, tempfile.mktemp(prefix="old_dll_"))
-                            except Exception:
-                                pass
-                    for d in dirs:
-                        try:
-                            os.rmdir(os.path.join(root, d))
-                        except OSError:
-                            pass
+                        shutil.move(fp, tempfile.mktemp(prefix="old_dll_"))
+                    except Exception as e:
+                        raise OSError(f"Could not remove locked file '{fp}': {e}") from e
+            for d in dirs:
                 try:
-                    os.rmdir(target)
+                    os.rmdir(os.path.join(root, d))
                 except OSError:
                     pass
+        try:
+            os.rmdir(target)
+        except OSError:
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def _deploy_staged_suite(staged_suite, suite_dir, rollback_dir):
+    """
+    Deploys staged PyInstaller output into suite_dir while keeping a rollback copy
+    of the previous installation and restoring it automatically if deployment fails.
+    """
+    staged_exe = os.path.join(staged_suite, f"{EXE_NAME}.exe")
+    if not os.path.isdir(staged_suite) or not os.path.isfile(staged_exe):
+        raise FileNotFoundError(f"Staged executable not found at '{staged_exe}'.")
+
+    _terminate_running_suite_processes()
+    os.makedirs(suite_dir, exist_ok=True)
+    os.makedirs(rollback_dir, exist_ok=True)
+
+    staged_items = os.listdir(staged_suite)
+    app_targets = []
+    for name in [f"{EXE_NAME}.exe", "_internal"] + list(staged_items):
+        if name not in app_targets and name not in RUNTIME_PRESERVE_ITEMS:
+            app_targets.append(name)
+
+    rolled_back_items = []
+    for name in app_targets:
+        existing_path = os.path.join(suite_dir, name)
+        if os.path.exists(existing_path):
+            rb_path = os.path.join(rollback_dir, name)
+            if os.path.isdir(existing_path):
+                shutil.copytree(existing_path, rb_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(existing_path, rb_path)
+            rolled_back_items.append(name)
+
+    try:
+        for name in rolled_back_items:
+            _remove_suite_target(os.path.join(suite_dir, name))
+
+        for item in staged_items:
+            s_item = os.path.join(staged_suite, item)
+            d_item = os.path.join(suite_dir, item)
+            if os.path.isdir(s_item):
+                shutil.copytree(s_item, d_item, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s_item, d_item)
+
+        deployed_exe = os.path.join(suite_dir, f"{EXE_NAME}.exe")
+        if not os.path.isfile(deployed_exe):
+            raise RuntimeError(f"Deployment verification failed: '{deployed_exe}' is missing.")
+    except Exception as deploy_err:
+        print(f"  [!] Deployment failed ({deploy_err}); restoring previous installation from rollback copy...")
+        for name in app_targets:
+            try:
+                _remove_suite_target(os.path.join(suite_dir, name))
+            except Exception:
+                pass
+        for name in rolled_back_items:
+            rb_src = os.path.join(rollback_dir, name)
+            rb_dst = os.path.join(suite_dir, name)
+            if os.path.exists(rb_src):
+                try:
+                    if os.path.isdir(rb_src):
+                        shutil.copytree(rb_src, rb_dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(rb_src, rb_dst)
+                except Exception as rb_err:
+                    print(f"  [!] Rollback warning for '{name}': {rb_err}")
+        raise
+
+
+def _cleanup_build_artifacts(root_logs_existed, preexisting_log_entries):
+    """Cleans up temporary PyInstaller workpath, .spec, __pycache__, and build-only root logs."""
+    try:
+        import logger_manager
+        logger_manager.close_logging_handlers()
+    except Exception:
+        pass
+
+    build_work_dir = os.path.join(PROJECT_DIR, "build")
+    spec_file = os.path.join(PROJECT_DIR, f"{PACKAGE_NAME}.spec")
+    root_logs_dir = os.path.join(PROJECT_DIR, "logs")
+    root_pycache_dir = os.path.join(PROJECT_DIR, "__pycache__")
+    try:
+        for d in (build_work_dir, root_pycache_dir):
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+
+        if os.path.exists(root_logs_dir):
+            if not root_logs_existed:
+                shutil.rmtree(root_logs_dir, ignore_errors=True)
+            else:
+                for entry in list(os.listdir(root_logs_dir)):
+                    if entry not in preexisting_log_entries:
+                        entry_path = os.path.join(root_logs_dir, entry)
+                        if os.path.isdir(entry_path):
+                            shutil.rmtree(entry_path, ignore_errors=True)
+                        else:
+                            try:
+                                os.remove(entry_path)
+                            except OSError:
+                                pass
+
+        if os.path.exists(spec_file):
+            os.remove(spec_file)
+        print("  [+] Cleaned up temporary PyInstaller build/, .spec, and root cache artifacts.")
+    except Exception as cleanup_err:
+        print(f"  [!] Notice: Could not remove temporary build artifacts: {cleanup_err}")
 
 
 def build_executable():
@@ -192,9 +298,17 @@ def build_executable():
     print(f"  BUILDING ONEDIR SUITE: {PACKAGE_NAME} ({EXE_NAME}.exe)")
     print("=" * 60)
 
+    root_logs_dir = os.path.join(PROJECT_DIR, "logs")
+    root_logs_existed = os.path.exists(root_logs_dir)
+    preexisting_log_entries = (
+        set(os.listdir(root_logs_dir))
+        if root_logs_existed and os.path.isdir(root_logs_dir)
+        else set()
+    )
+
     dist_root = os.path.join(PROJECT_DIR, "dist")
     suite_dir = os.path.join(dist_root, PACKAGE_NAME)
-    _terminate_running_suite_processes(suite_dir)
+    _terminate_running_suite_processes()
     verify_frozen_path_anchoring()
 
     if not check_pyinstaller():
@@ -202,14 +316,24 @@ def build_executable():
         print("    Install it with: pip install pyinstaller")
         return False
 
-    dist_root = os.path.join(PROJECT_DIR, "dist")
-    suite_dir = os.path.join(dist_root, PACKAGE_NAME)
-
     with tempfile.TemporaryDirectory() as temp_root:
         backup_dir = os.path.join(temp_root, "backup")
         stage_dist = os.path.join(temp_root, "stage_dist")
+        rollback_dir = os.path.join(temp_root, "rollback")
+        build_logs_dir = os.path.join(temp_root, "build_logs")
         os.makedirs(backup_dir, exist_ok=True)
         os.makedirs(stage_dist, exist_ok=True)
+        os.makedirs(rollback_dir, exist_ok=True)
+        os.makedirs(build_logs_dir, exist_ok=True)
+
+        try:
+            import logger_manager
+            logger_manager.setup_logging(
+                {"logging": {"log_dir": build_logs_dir, "log_file": "build.log"}},
+                force_reinit=True,
+            )
+        except Exception:
+            pass
 
         preserved_items = _backup_runtime_data(suite_dir, backup_dir)
         if preserved_items:
@@ -234,6 +358,7 @@ def build_executable():
             "--hidden-import", "win32ui",
             "--hidden-import", "win32con",
             "--hidden-import", "win32gui",
+            "--hidden-import=win32timezone",
             "--hidden-import", "PIL.ImageWin",
             # Exclude heavy unused libraries present in global Python to keep binary compact and fast
             "--exclude-module", "matplotlib",
@@ -260,91 +385,85 @@ def build_executable():
         print(f"\nRunning command:\n  {' '.join(cmd)}\n")
         result = subprocess.run(cmd, cwd=PROJECT_DIR)
 
-        if result.returncode == 0:
-            staged_suite = os.path.join(stage_dist, PACKAGE_NAME)
-            os.makedirs(suite_dir, exist_ok=True)
-            _terminate_running_suite_processes(suite_dir)
-            for item in os.listdir(staged_suite):
-                s_item = os.path.join(staged_suite, item)
-                d_item = os.path.join(suite_dir, item)
-                if os.path.isdir(s_item):
-                    shutil.copytree(s_item, d_item, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s_item, d_item)
+        if result.returncode != 0:
+            try:
+                import logger_manager
+                logger_manager.close_logging_handlers()
+            except Exception:
+                pass
+            print(f"\n[!] Build failed with exit code {result.returncode}.")
+            return False
+
+        staged_suite = os.path.join(stage_dist, PACKAGE_NAME)
+        try:
+            _deploy_staged_suite(staged_suite, suite_dir, rollback_dir)
+        except Exception as deploy_err:
+            if preserved_items:
+                _restore_runtime_data(backup_dir, suite_dir, preserved_items)
+            try:
+                import logger_manager
+                logger_manager.close_logging_handlers()
+            except Exception:
+                pass
+            print(f"\n[!] Deployment of staged build failed: {deploy_err}")
+            return False
 
         if preserved_items:
             _restore_runtime_data(backup_dir, suite_dir, preserved_items)
 
-    if result.returncode != 0:
-        print(f"\n[!] Build failed with exit code {result.returncode}.")
-        return False
+        exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
+        if os.path.exists(exe_path):
+            # Copy default config.json only if not already present in dist/ERP_Automation_Suite/ (preserves user calibration)
+            src_cfg = os.path.join(PROJECT_DIR, "config.json")
+            dest_cfg = os.path.join(suite_dir, "config.json")
+            if os.path.exists(src_cfg) and not os.path.exists(dest_cfg):
+                shutil.copy2(src_cfg, dest_cfg)
+                print(f"  [+] Config initialized: {dest_cfg}")
 
-    exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
+            # Copy sample/active complaints.xlsx if not present in suite folder
+            src_xlsx = os.path.join(PROJECT_DIR, "complaints.xlsx")
+            dest_xlsx = os.path.join(suite_dir, "complaints.xlsx")
+            if os.path.exists(src_xlsx) and not os.path.exists(dest_xlsx):
+                shutil.copy2(src_xlsx, dest_xlsx)
+                print(f"  [+] Input dataset deployed to: {dest_xlsx}")
 
-    if os.path.exists(exe_path):
-        # Copy default config.json only if not already present in dist/ERP_Automation_Suite/ (preserves user calibration)
-        src_cfg = os.path.join(PROJECT_DIR, "config.json")
-        dest_cfg = os.path.join(suite_dir, "config.json")
-        if os.path.exists(src_cfg) and not os.path.exists(dest_cfg):
-            shutil.copy2(src_cfg, dest_cfg)
-            print(f"  [+] Config initialized: {dest_cfg}")
+            # Ensure logs/ directory exists in suite folder
+            dest_logs = os.path.join(suite_dir, "logs")
+            os.makedirs(dest_logs, exist_ok=True)
+            print(f"  [+] Initialized rotating logs directory: {dest_logs}")
 
-        # Copy sample/active complaints.xlsx if not present in suite folder
-        src_xlsx = os.path.join(PROJECT_DIR, "complaints.xlsx")
-        dest_xlsx = os.path.join(suite_dir, "complaints.xlsx")
-        if os.path.exists(src_xlsx) and not os.path.exists(dest_xlsx):
-            shutil.copy2(src_xlsx, dest_xlsx)
-            print(f"  [+] Input dataset deployed to: {dest_xlsx}")
+            # Initialize SQLite state database, migrate any legacy .txt files, and sync Today_Complaints/ in suite_dir
+            dest_db = os.path.join(suite_dir, "complaints_state.db")
+            dest_completed_txt = os.path.join(suite_dir, "completed_complaints.txt")
+            dest_printed_txt = os.path.join(suite_dir, "printed_complaints.txt")
+            dest_out_dir = os.path.join(suite_dir, "Today_Complaints")
+            state_manager.init_db(dest_db, output_dir=dest_out_dir, sync_disk=False)
+            if os.path.exists(dest_completed_txt) or os.path.exists(dest_printed_txt):
+                state_manager.migrate_legacy_txt_files(
+                    db_path=dest_db,
+                    completed_txt_path=dest_completed_txt,
+                    printed_txt_path=dest_printed_txt,
+                    output_dir=dest_out_dir,
+                    archive_after_migrate=True,
+                )
+            state_manager.sync_disk_to_db(dest_db, output_dir=dest_out_dir, announce=True)
+            print(f"  [+] Initialized SQLite state database: {dest_db}")
 
-        # Ensure logs/ directory exists in suite folder
-        dest_logs = os.path.join(suite_dir, "logs")
-        os.makedirs(dest_logs, exist_ok=True)
-        print(f"  [+] Initialized rotating logs directory: {dest_logs}")
-
-        # Initialize SQLite state database, migrate any legacy .txt files, and sync Today_Complaints/ in suite_dir
-        dest_db = os.path.join(suite_dir, "complaints_state.db")
-        dest_completed_txt = os.path.join(suite_dir, "completed_complaints.txt")
-        dest_printed_txt = os.path.join(suite_dir, "printed_complaints.txt")
-        dest_out_dir = os.path.join(suite_dir, "Today_Complaints")
-        state_manager.init_db(dest_db, output_dir=dest_out_dir, sync_disk=False)
-        if os.path.exists(dest_completed_txt) or os.path.exists(dest_printed_txt):
-            state_manager.migrate_legacy_txt_files(
-                db_path=dest_db,
-                completed_txt_path=dest_completed_txt,
-                printed_txt_path=dest_printed_txt,
-                output_dir=dest_out_dir,
-                archive_after_migrate=True,
-            )
-        state_manager.sync_disk_to_db(dest_db, output_dir=dest_out_dir, announce=True)
-        print(f"  [+] Initialized SQLite state database: {dest_db}")
-
-        print("\n" + "=" * 60)
-        print("  BUILD SUCCESSFUL!")
-        print(f"  Distribution Suite: {suite_dir}")
-        print(f"  Executable Location: {exe_path}")
-        print("=" * 60)
-
-        # Clean up temporary PyInstaller workpath (build/), .spec file, and any root logs/ created during build
         try:
             import logger_manager
             logger_manager.close_logging_handlers()
         except Exception:
             pass
 
-        build_work_dir = os.path.join(PROJECT_DIR, "build")
-        spec_file = os.path.join(PROJECT_DIR, f"{PACKAGE_NAME}.spec")
-        root_logs_dir = os.path.join(PROJECT_DIR, "logs")
-        root_pycache_dir = os.path.join(PROJECT_DIR, "__pycache__")
-        try:
-            for d in (build_work_dir, root_logs_dir, root_pycache_dir):
-                if os.path.exists(d):
-                    shutil.rmtree(d, ignore_errors=True)
-            if os.path.exists(spec_file):
-                os.remove(spec_file)
-            print("  [+] Cleaned up temporary PyInstaller build/, .spec, and root cache artifacts.")
-        except Exception as cleanup_err:
-            print(f"  [!] Notice: Could not remove temporary build artifacts: {cleanup_err}")
+    exe_path = os.path.join(suite_dir, f"{EXE_NAME}.exe")
+    if os.path.exists(exe_path):
+        print("\n" + "=" * 60)
+        print("  BUILD SUCCESSFUL!")
+        print(f"  Distribution Suite: {suite_dir}")
+        print(f"  Executable Location: {exe_path}")
+        print("=" * 60)
 
+        _cleanup_build_artifacts(root_logs_existed, preexisting_log_entries)
         return True
 
     print(f"\n[!] Build completed but executable was not found at {exe_path}.")

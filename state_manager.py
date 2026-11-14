@@ -17,6 +17,7 @@ import config_manager
 import logger_manager
 
 VALID_STATUSES = ("DOWNLOADED", "SPOOLED", "PRINTED", "PRINT_FAILED")
+_MIGRATED_TXT_TO_DB: Dict[str, str] = {}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS complaints (
@@ -56,7 +57,67 @@ def _infer_technician_from_path(file_path: str) -> str:
     return "Unknown"
 
 
-def resolve_db_path(target: Optional[Union[str, Dict]] = None) -> Tuple[str, Optional[str]]:
+def _norm_path_key(path_str: str) -> str:
+    """Normalizes a filesystem path for case-insensitive dictionary lookups on Windows."""
+    return os.path.normcase(os.path.abspath(path_str))
+
+
+def _register_migrated_txt_mapping(txt_path: Optional[str], db_path: str, archive_path: Optional[str] = None) -> None:
+    """Records a legacy .txt tracker path -> migrated SQLite database path mapping."""
+    if not db_path:
+        return
+    abs_db = os.path.abspath(db_path)
+    for candidate in (txt_path, archive_path):
+        if candidate and str(candidate).strip():
+            resolved = config_manager.resolve_path(str(candidate).strip())
+            _MIGRATED_TXT_TO_DB[_norm_path_key(resolved)] = abs_db
+
+
+def _find_legacy_txt_for_target(
+    target: Optional[Union[str, Dict]],
+    db_path: str,
+    tracker_kind: Optional[str] = None,
+) -> Optional[str]:
+    """Finds an unmigrated legacy .txt file associated with a None or config-dict target."""
+    candidates = []
+    if isinstance(target, dict):
+        settings = target.get("settings") if isinstance(target.get("settings"), dict) else {}
+        printing = target.get("printing") if isinstance(target.get("printing"), dict) else {}
+        if tracker_kind == "printed":
+            raw_list = [printing.get("printed_tracker_file"), settings.get("progress_file")]
+        elif tracker_kind == "completed":
+            raw_list = [settings.get("progress_file"), printing.get("printed_tracker_file")]
+        else:
+            raw_list = [printing.get("printed_tracker_file"), settings.get("progress_file")]
+        for item in raw_list:
+            if item and str(item).strip():
+                resolved_item = config_manager.resolve_path(str(item).strip())
+                if not resolved_item.lower().endswith((".db", ".sqlite", ".sqlite3")):
+                    candidates.append(resolved_item)
+
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    if db_dir:
+        if tracker_kind == "printed":
+            default_names = ("printed_complaints.txt",)
+        elif tracker_kind == "completed":
+            default_names = ("completed_complaints.txt",)
+        else:
+            default_names = ("printed_complaints.txt", "completed_complaints.txt")
+        for name in default_names:
+            p = os.path.join(db_dir, name)
+            if p not in candidates:
+                candidates.append(p)
+
+    for c in candidates:
+        if os.path.exists(c) and os.path.isfile(c):
+            return c
+    return None
+
+
+def resolve_db_path(
+    target: Optional[Union[str, Dict]] = None,
+    tracker_kind: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
     """
     Resolves a database path or legacy tracker path into:
         (sqlite_db_path, legacy_txt_path_if_passed)
@@ -64,29 +125,62 @@ def resolve_db_path(target: Optional[Union[str, Dict]] = None) -> Tuple[str, Opt
       - None: resolves default 'complaints_state.db' from config_manager.
       - dict (config): resolves settings['database_file'] from config.
       - str ending with .db/.sqlite/.sqlite3: resolves directly.
-      - str ending with .txt (legacy caller compatibility): maps to 'complaints_state.db'
-        in the same directory as the legacy .txt path and returns the .txt path for
-        automatic on-the-fly migration if present.
+      - str ending with .txt (legacy caller compatibility): maps to the migrated SQLite
+        database (or 'complaints_state.db' in the same directory) and returns the .txt path
+        for automatic on-the-fly migration if present.
     """
     if target is None:
-        return config_manager.get_database_path(), None
+        db_path = config_manager.get_database_path()
+        return db_path, _find_legacy_txt_for_target(None, db_path, tracker_kind=tracker_kind)
 
     if isinstance(target, dict):
-        return config_manager.get_database_path(target), None
+        db_path = config_manager.get_database_path(target)
+        return db_path, _find_legacy_txt_for_target(target, db_path, tracker_kind=tracker_kind)
 
     raw = str(target).strip()
     if not raw:
-        return config_manager.get_database_path(), None
+        db_path = config_manager.get_database_path()
+        return db_path, _find_legacy_txt_for_target(None, db_path, tracker_kind=tracker_kind)
 
     resolved = config_manager.resolve_path(raw)
     low = resolved.lower()
     if low.endswith((".db", ".sqlite", ".sqlite3")):
         return resolved, None
 
-    # Legacy .txt path passed by caller: map to complaints_state.db in the same directory
+    # Check if this legacy .txt path was already migrated to a specific database path
+    norm_key = _norm_path_key(resolved)
+    mapped_db = _MIGRATED_TXT_TO_DB.get(norm_key)
+    if mapped_db:
+        return mapped_db, resolved
+
+    # Legacy .txt path passed by caller: map to the migrated database or complaints_state.db
     parent_dir = os.path.dirname(os.path.abspath(resolved))
-    db_path = os.path.join(parent_dir, "complaints_state.db")
-    return db_path, resolved
+    base_dir = os.path.abspath(config_manager.get_base_dir())
+    default_sibling_db = os.path.join(parent_dir, "complaints_state.db")
+
+    if os.path.normcase(parent_dir) == os.path.normcase(base_dir):
+        cfg_db = config_manager.get_database_path()
+        if os.path.exists(cfg_db) or not os.path.exists(default_sibling_db):
+            return cfg_db, resolved
+
+    if os.path.exists(default_sibling_db):
+        return default_sibling_db, resolved
+
+    # If a single custom-named SQLite database exists in parent_dir alongside the migrated tracker, use it
+    if os.path.isdir(parent_dir):
+        try:
+            db_candidates = sorted(
+                entry
+                for entry in os.listdir(parent_dir)
+                if entry.lower().endswith((".db", ".sqlite", ".sqlite3"))
+                and os.path.isfile(os.path.join(parent_dir, entry))
+            )
+            if len(db_candidates) == 1:
+                return os.path.join(parent_dir, db_candidates[0]), resolved
+        except Exception:
+            pass
+
+    return default_sibling_db, resolved
 
 
 @contextmanager
@@ -323,16 +417,58 @@ def _parse_printed_txt_line(line: str) -> Optional[Tuple[str, str, str, str, str
     return cid, status, ts, printer_name, file_name, job_id
 
 
-def _migrate_single_legacy_txt(db_path: str, txt_path: str, output_dir: Optional[str] = None) -> int:
+def _detect_legacy_txt_kind(txt_path: str, tracker_kind: Optional[str] = None) -> str:
+    """Determines whether a legacy .txt file is a 'printed' or 'completed' tracker."""
+    if tracker_kind in ("printed", "completed"):
+        if tracker_kind == "completed" and os.path.exists(txt_path):
+            try:
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s and not s.startswith("#"):
+                            if "|" in s:
+                                return "printed"
+                            break
+            except Exception:
+                pass
+        return tracker_kind
+
+    bname = os.path.basename(txt_path).lower()
+    if "printed" in bname:
+        return "printed"
+    if "completed" in bname or "progress" in bname:
+        return "completed"
+
+    if os.path.exists(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        if "|" in s:
+                            return "printed"
+                        break
+        except Exception:
+            pass
+    return "completed"
+
+
+def _migrate_single_legacy_txt(
+    db_path: str,
+    txt_path: str,
+    output_dir: Optional[str] = None,
+    tracker_kind: Optional[str] = None,
+) -> int:
     """
     Migrates a single legacy .txt file (completed_complaints.txt or printed_complaints.txt)
     into db_path if it exists and has not been migrated yet.
     """
+    _register_migrated_txt_mapping(txt_path, db_path)
     if not txt_path or not os.path.exists(txt_path):
         return 0
 
-    bname = os.path.basename(txt_path).lower()
-    if "printed" in bname:
+    kind = _detect_legacy_txt_kind(txt_path, tracker_kind=tracker_kind)
+    if kind == "printed":
         res = migrate_legacy_txt_files(
             db_path=db_path, completed_txt_path=None, printed_txt_path=txt_path, output_dir=output_dir
         )
@@ -342,6 +478,61 @@ def _migrate_single_legacy_txt(db_path: str, txt_path: str, output_dir: Optional
             db_path=db_path, completed_txt_path=txt_path, printed_txt_path=None, output_dir=output_dir
         )
         return res.get("completed_migrated", 0)
+
+
+def ensure_tracker_db_ready(
+    target: Optional[Union[str, Dict]] = None,
+    tracker_kind: Optional[str] = None,
+    output_dir: Optional[str] = None,
+) -> str:
+    """
+    Resolves `target` (database path, legacy .txt path, config dict, or None) to its
+    SQLite database path and migrates any pending legacy .txt tracker file(s) before
+    the caller opens the database. Preserves existing behavior for database paths.
+    """
+    db_path, legacy_txt = resolve_db_path(target, tracker_kind=tracker_kind)
+    resolved_output_dir = output_dir
+    if resolved_output_dir is None and (isinstance(target, dict) or (legacy_txt and os.path.exists(legacy_txt))):
+        resolved_output_dir = _resolve_output_dir(target, db_path, output_dir)
+
+    if isinstance(target, dict):
+        settings = target.get("settings") if isinstance(target.get("settings"), dict) else {}
+        printing = target.get("printing") if isinstance(target.get("printing"), dict) else {}
+        raw_completed = settings.get("progress_file")
+        raw_printed = printing.get("printed_tracker_file")
+        c_path = (
+            config_manager.resolve_path(str(raw_completed).strip())
+            if raw_completed and str(raw_completed).strip()
+            else None
+        )
+        p_path = (
+            config_manager.resolve_path(str(raw_printed).strip())
+            if raw_printed and str(raw_printed).strip()
+            else None
+        )
+        if c_path and c_path.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            c_path = None
+        if p_path and p_path.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            p_path = None
+        _register_migrated_txt_mapping(c_path, db_path)
+        _register_migrated_txt_mapping(p_path, db_path)
+        if (c_path and os.path.exists(c_path)) or (p_path and os.path.exists(p_path)):
+            migrate_legacy_txt_files(
+                db_path=db_path,
+                completed_txt_path=c_path if (c_path and os.path.exists(c_path)) else None,
+                printed_txt_path=p_path if (p_path and os.path.exists(p_path)) else None,
+                output_dir=resolved_output_dir,
+            )
+
+    if legacy_txt and os.path.exists(legacy_txt):
+        _migrate_single_legacy_txt(
+            db_path,
+            legacy_txt,
+            output_dir=resolved_output_dir,
+            tracker_kind=tracker_kind,
+        )
+
+    return db_path
 
 
 def migrate_legacy_txt_files(
@@ -357,7 +548,10 @@ def migrate_legacy_txt_files(
     non-empty migrated .txt files to .migrated.bak.
     """
     resolved_db, _ = resolve_db_path(db_path)
-    pdf_map = _discover_existing_pdfs(output_dir)
+    _register_migrated_txt_mapping(completed_txt_path, resolved_db)
+    _register_migrated_txt_mapping(printed_txt_path, resolved_db)
+    resolved_output_dir = _resolve_output_dir(db_path, resolved_db, output_dir) if output_dir is None else output_dir
+    pdf_map = _discover_existing_pdfs(resolved_output_dir)
     now = _now_str()
 
     completed_ids = []
@@ -393,7 +587,8 @@ def migrate_legacy_txt_files(
                         os.remove(empty_txt)
                         _logger().debug("Removed empty legacy placeholder file: %s", empty_txt)
                     else:
-                        _archive_migrated_txt(empty_txt)
+                        bak = _archive_migrated_txt(empty_txt)
+                        _register_migrated_txt_mapping(empty_txt, resolved_db, archive_path=bak)
                 except Exception:
                     pass
         return {"completed_migrated": 0, "printed_migrated": 0}
@@ -464,7 +659,8 @@ def migrate_legacy_txt_files(
         for p in (completed_txt_path, printed_txt_path):
             if p and os.path.exists(p):
                 if os.path.getsize(p) > 0:
-                    _archive_migrated_txt(p)
+                    bak = _archive_migrated_txt(p)
+                    _register_migrated_txt_mapping(p, resolved_db, archive_path=bak)
                 else:
                     try:
                         os.remove(p)
@@ -482,9 +678,7 @@ def get_completed_complaints(target: Optional[Union[str, Dict]] = None) -> Set[s
     Returns the set of all complaint IDs that have been downloaded/recorded in SQLite
     (status in DOWNLOADED, SPOOLED, PRINTED, PRINT_FAILED).
     """
-    db_path, legacy_txt = resolve_db_path(target)
-    if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+    db_path = ensure_tracker_db_ready(target, tracker_kind="completed")
 
     if not os.path.exists(db_path):
         return set()
@@ -507,9 +701,7 @@ def load_printed_complaints(target: Optional[Union[str, Dict]] = None) -> Set[st
     so they remain eligible for printing or retry.
     Propagates database errors to the caller so batch print never silently double-prints.
     """
-    db_path, legacy_txt = resolve_db_path(target)
-    if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+    db_path = ensure_tracker_db_ready(target, tracker_kind="printed")
 
     if not os.path.exists(db_path):
         return set()
@@ -537,9 +729,7 @@ def mark_complaint_downloaded(
     if not cid:
         raise ValueError("complaint_no cannot be empty.")
 
-    db_path, legacy_txt = resolve_db_path(target)
-    if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+    db_path = ensure_tracker_db_ready(target, tracker_kind="completed")
 
     tech = str(technician).strip() if technician else _infer_technician_from_path(file_path)
     if not tech or tech.lower() == "nan":
@@ -596,9 +786,7 @@ def _upsert_print_state(
     if norm_status not in VALID_STATUSES:
         norm_status = "PRINT_FAILED"
 
-    db_path, legacy_txt = resolve_db_path(target)
-    if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+    db_path = ensure_tracker_db_ready(target, tracker_kind="printed")
 
     fpath = str(file_path or "").strip()
     tech = str(technician).strip() if technician else _infer_technician_from_path(fpath)
@@ -722,9 +910,7 @@ def reset_printed_tracker_safe(target: Optional[Union[str, Dict]] = None) -> Opt
     Preserves ERP download state so Mode [1] never unnecessarily re-downloads existing PDFs.
     If creating the backup fails, aborts before modifying any records.
     """
-    db_path, legacy_txt = resolve_db_path(target)
-    if legacy_txt and os.path.exists(legacy_txt):
-        _migrate_single_legacy_txt(db_path, legacy_txt)
+    db_path = ensure_tracker_db_ready(target, tracker_kind="printed")
 
     backup_path = None
     with _connect_db(db_path) as conn:
@@ -777,7 +963,7 @@ def get_complaint_record(complaint_no: str, target: Optional[Union[str, Dict]] =
     cid = str(complaint_no).strip()
     if not cid:
         return None
-    db_path, _ = resolve_db_path(target)
+    db_path = ensure_tracker_db_ready(target)
     if not os.path.exists(db_path):
         return None
     with _connect_db(db_path) as conn:
@@ -788,7 +974,7 @@ def get_complaint_record(complaint_no: str, target: Optional[Union[str, Dict]] =
 def get_status_counts(target: Optional[Union[str, Dict]] = None) -> Dict[str, int]:
     """Returns counts of complaints grouped by status, plus TOTAL."""
     counts = {"TOTAL": 0, "DOWNLOADED": 0, "SPOOLED": 0, "PRINTED": 0, "PRINT_FAILED": 0}
-    db_path, _ = resolve_db_path(target)
+    db_path = ensure_tracker_db_ready(target)
     if not os.path.exists(db_path):
         return counts
     with _connect_db(db_path) as conn:
