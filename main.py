@@ -648,6 +648,7 @@ def run_batch_print_mode(config):
         output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
         db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed", output_dir=output_dir)
         max_queue = printing_settings.get("max_spool_queue", 3)
+        spooler_query_timeout = printing_settings.get("spooler_query_timeout", 5.0)
 
         if not os.path.exists(output_dir):
             logger.warning(f"\n[!] Output directory '{output_dir}' does not exist. No PDFs to print.")
@@ -879,9 +880,18 @@ def run_batch_print_mode(config):
             in_flight = []
 
             def _on_poll_reconcile(spool_status):
-                c_done, f_done = printer_manager.reconcile_in_flight_jobs(
-                    target_printer, in_flight, db_path, status=spool_status
-                )
+                try:
+                    c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                        target_printer,
+                        in_flight,
+                        db_path,
+                        status=spool_status,
+                        spooler_query_timeout=spooler_query_timeout,
+                    )
+                except TypeError:
+                    c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                        target_printer, in_flight, db_path, status=spool_status
+                    )
                 stats["printed"] += c_done
                 stats["failed"] += len(f_done)
 
@@ -893,9 +903,17 @@ def run_batch_print_mode(config):
 
                 # Opportunistically reconcile any in-flight jobs that finished before this iteration
                 try:
-                    c_done, f_done = printer_manager.reconcile_in_flight_jobs(
-                        target_printer, in_flight, db_path
-                    )
+                    try:
+                        c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                            target_printer,
+                            in_flight,
+                            db_path,
+                            spooler_query_timeout=spooler_query_timeout,
+                        )
+                    except TypeError:
+                        c_done, f_done = printer_manager.reconcile_in_flight_jobs(
+                            target_printer, in_flight, db_path
+                        )
                     stats["printed"] += c_done
                     stats["failed"] += len(f_done)
                 except Exception as rec_err:
@@ -910,12 +928,21 @@ def run_batch_print_mode(config):
 
                 # Sliding-Window Spooler Queue Gate: keeps up to max_queue jobs buffered
                 try:
-                    gate_ok = printer_manager.enforce_queue_gate(
-                        target_printer,
-                        max_jobs=max_queue,
-                        on_poll=_on_poll_reconcile,
-                        check_abort_fn=engine.check_abort,
-                    )
+                    try:
+                        gate_ok = printer_manager.enforce_queue_gate(
+                            target_printer,
+                            max_jobs=max_queue,
+                            on_poll=_on_poll_reconcile,
+                            check_abort_fn=engine.check_abort,
+                            spooler_query_timeout=spooler_query_timeout,
+                        )
+                    except TypeError:
+                        gate_ok = printer_manager.enforce_queue_gate(
+                            target_printer,
+                            max_jobs=max_queue,
+                            on_poll=_on_poll_reconcile,
+                            check_abort_fn=engine.check_abort,
+                        )
                 except KeyboardInterrupt:
                     stats["aborted"] = True
                     break
@@ -974,12 +1001,21 @@ def run_batch_print_mode(config):
             # Final Drain Pass: reconcile all remaining spooled jobs in the sliding window
             if in_flight and not stats["aborted"]:
                 try:
-                    c_drained, f_drained, drain_aborted = printer_manager.drain_in_flight_jobs(
-                        target_printer,
-                        in_flight,
-                        db_path,
-                        check_abort_fn=engine.check_abort,
-                    )
+                    try:
+                        c_drained, f_drained, drain_aborted = printer_manager.drain_in_flight_jobs(
+                            target_printer,
+                            in_flight,
+                            db_path,
+                            check_abort_fn=engine.check_abort,
+                            spooler_query_timeout=spooler_query_timeout,
+                        )
+                    except TypeError:
+                        c_drained, f_drained, drain_aborted = printer_manager.drain_in_flight_jobs(
+                            target_printer,
+                            in_flight,
+                            db_path,
+                            check_abort_fn=engine.check_abort,
+                        )
                     stats["printed"] += c_drained
                     stats["failed"] += len(f_drained)
                     if drain_aborted:

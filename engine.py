@@ -118,6 +118,7 @@ def _dispatch_live_print(num, file_path, config, timings):
     target_printer, is_fallback = config_manager.get_configured_printer(config)
     db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed")
     max_queue = printing_cfg.get("max_spool_queue", 3)
+    spooler_query_timeout = printing_cfg.get("spooler_query_timeout", 5.0)
 
     if not target_printer:
         logger.warning("[!] Warning: No Windows printer available for live printing.")
@@ -127,7 +128,14 @@ def _dispatch_live_print(num, file_path, config, timings):
     logger.info(f"[*] Live Print: Checking spooler queue on '{target_printer}'{fallback_note}...")
 
     try:
-        gate_ok = pm.enforce_queue_gate(target_printer, max_jobs=max_queue)
+        try:
+            gate_ok = pm.enforce_queue_gate(
+                target_printer,
+                max_jobs=max_queue,
+                spooler_query_timeout=spooler_query_timeout,
+            )
+        except TypeError:
+            gate_ok = pm.enforce_queue_gate(target_printer, max_jobs=max_queue)
     except KeyboardInterrupt:
         logger.warning("Live print aborted by user during print queue gate for complaint #%s.", num)
         return False, "Process aborted by user during print queue gate."
@@ -162,9 +170,17 @@ def _dispatch_live_print(num, file_path, config, timings):
         pm.mark_complaint_spooled(
             db_path, num, file_path, target_printer, job_id=job_id
         )
-        confirmed, status_msg = pm.reconcile_print_job(
-            target_printer, job_id=job_id, doc_name=doc_name
-        )
+        try:
+            confirmed, status_msg = pm.reconcile_print_job(
+                target_printer,
+                job_id=job_id,
+                doc_name=doc_name,
+                spooler_query_timeout=spooler_query_timeout,
+            )
+        except TypeError:
+            confirmed, status_msg = pm.reconcile_print_job(
+                target_printer, job_id=job_id, doc_name=doc_name
+            )
         if not confirmed:
             raise RuntimeError(f"Print job not confirmed ({status_msg})")
         if not pm.mark_complaint_printed(

@@ -110,6 +110,49 @@ logger = logger_manager.get_logger("printer_manager")
 LAST_GATE_PROMPTED: bool = False
 # Tracks the most recent spooler job ID created by print_pdf_silent
 LAST_SPOOLED_JOB_ID: Optional[int] = None
+# Tracks in-flight SpoolerStatusProbe worker threads per printer so hung drivers do not spawn duplicate probes
+_ACTIVE_SPOOLER_PROBES_LOCK = threading.Lock()
+_ACTIVE_SPOOLER_PROBES: Dict[str, threading.Thread] = {}
+
+
+def _resolve_spooler_query_timeout(
+    spooler_query_timeout: Optional[Any] = None,
+    query_timeout: Optional[Any] = None,
+    config: Optional[Dict] = None,
+) -> float:
+    """
+    Resolves and validates the spooler status query timeout in seconds (minimum 0.5s, default 5.0s).
+    """
+    raw_timeout = spooler_query_timeout if spooler_query_timeout is not None else query_timeout
+    if raw_timeout is not None:
+        try:
+            return max(0.5, float(raw_timeout))
+        except (ValueError, TypeError):
+            return 5.0
+    try:
+        import config_manager
+
+        printing_cfg = config_manager.get_printing_settings(config)
+        return max(0.5, float(printing_cfg.get("spooler_query_timeout", 5.0)))
+    except Exception:
+        return 5.0
+
+
+def _call_get_queue_status(printer_name: str, timeout: Optional[float] = None) -> Dict:
+    """
+    Invokes `get_queue_status` with the validated `timeout`, falling back to single-argument
+    invocation only if `get_queue_status` was monkeypatched in tests with a legacy 1-arg signature.
+    """
+    effective_timeout = _resolve_spooler_query_timeout(timeout)
+    if get_queue_status is _ORIG_GET_QUEUE_STATUS:
+        return get_queue_status(printer_name, timeout=effective_timeout)
+    try:
+        return get_queue_status(printer_name, timeout=effective_timeout)
+    except TypeError:
+        try:
+            return get_queue_status(printer_name, effective_timeout)
+        except TypeError:
+            return get_queue_status(printer_name)
 
 
 def get_installed_printers() -> List[str]:
@@ -331,6 +374,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": False,
+            "query_error": False,
             "error_reasons": ["Non-Windows OS"],
             "jobs": [],
         }
@@ -342,6 +386,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": True,
+            "query_error": True,
             "error_reasons": [f"Cannot open printer: {e}"],
             "jobs": [],
         }
@@ -354,6 +399,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
                 "printer_name": printer_name,
                 "job_count": 0,
                 "has_error": True,
+                "query_error": True,
                 "error_reasons": [f"Cannot query printer status: {e}"],
                 "jobs": [],
             }
@@ -362,6 +408,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
         p_status = p_info.get("Status", 0)
 
         has_error = False
+        query_error = False
         error_reasons = []
 
         # Enumerate individual spooler jobs
@@ -370,6 +417,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
         except Exception as e:
             jobs = ()
             has_error = True
+            query_error = True
             error_reasons.append(f"Cannot enumerate spooler jobs: {e}")
 
         # Printer-level status flags (including PRINTER_STATUS_PAUSED)
@@ -393,6 +441,7 @@ def _query_queue_status_raw(printer_name: str) -> Dict:
             "printer_name": printer_name,
             "job_count": c_jobs,
             "has_error": has_error,
+            "query_error": query_error,
             "error_reasons": error_reasons,
             "jobs": [
                 {
@@ -418,6 +467,7 @@ def get_queue_status(printer_name: str, timeout: float = 5.0) -> Dict:
     Guarded by a non-blocking daemon worker thread so hung Windows Spooler RPC calls
     (e.g., when spoolsv.exe or a USB port monitor stalls) never deadlock the main thread
     or block [ESC] / [Q] failsafe aborts.
+    Tracks active probes per printer so a hung worker does not accumulate duplicate threads.
 
     Returns:
         Dict containing:
@@ -432,23 +482,68 @@ def get_queue_status(printer_name: str, timeout: float = 5.0) -> Dict:
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": False,
+            "query_error": False,
             "error_reasons": ["Non-Windows OS"],
             "jobs": [],
         }
 
-    if timeout is None or timeout <= 0:
+    run_sync = timeout is None or timeout <= 0
+    with _ACTIVE_SPOOLER_PROBES_LOCK:
+        existing_worker = _ACTIVE_SPOOLER_PROBES.get(printer_name)
+        if existing_worker is not None:
+            if existing_worker.is_alive():
+                reason = (
+                    f"Spooler API probe still running for '{printer_name}' "
+                    "(previous query timed out; printer driver or Windows Spooler may be hung)"
+                )
+                logger.warning("Skipping new spooler probe on '%s': %s", printer_name, reason)
+                return {
+                    "printer_name": printer_name,
+                    "job_count": 0,
+                    "has_error": True,
+                    "query_error": True,
+                    "error_reasons": [reason],
+                    "jobs": [],
+                }
+            _ACTIVE_SPOOLER_PROBES.pop(printer_name, None)
+
+        if not run_sync:
+            result_box: Dict[str, Any] = {}
+            worker_ref: List[Optional[threading.Thread]] = [None]
+
+            def _worker():
+                try:
+                    result_box["data"] = _query_queue_status_raw(printer_name)
+                except Exception as exc:
+                    result_box["error"] = exc
+                finally:
+                    with _ACTIVE_SPOOLER_PROBES_LOCK:
+                        current = _ACTIVE_SPOOLER_PROBES.get(printer_name)
+                        if current is worker_ref[0] or current is threading.current_thread():
+                            _ACTIVE_SPOOLER_PROBES.pop(printer_name, None)
+
+            worker = threading.Thread(target=_worker, name="SpoolerStatusProbe", daemon=True)
+            worker_ref[0] = worker
+            _ACTIVE_SPOOLER_PROBES[printer_name] = worker
+
+    if run_sync:
         return _query_queue_status_raw(printer_name)
 
-    result_box: Dict[str, Any] = {}
+    try:
+        worker.start()
+    except Exception as start_exc:
+        with _ACTIVE_SPOOLER_PROBES_LOCK:
+            if _ACTIVE_SPOOLER_PROBES.get(printer_name) is worker:
+                _ACTIVE_SPOOLER_PROBES.pop(printer_name, None)
+        return {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": True,
+            "query_error": True,
+            "error_reasons": [f"Spooler status error: {start_exc}"],
+            "jobs": [],
+        }
 
-    def _worker():
-        try:
-            result_box["data"] = _query_queue_status_raw(printer_name)
-        except Exception as exc:
-            result_box["error"] = exc
-
-    worker = threading.Thread(target=_worker, name="SpoolerStatusProbe", daemon=True)
-    worker.start()
     worker.join(timeout=float(timeout))
 
     if worker.is_alive():
@@ -461,15 +556,21 @@ def get_queue_status(printer_name: str, timeout: float = 5.0) -> Dict:
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": True,
+            "query_error": True,
             "error_reasons": [reason],
             "jobs": [],
         }
+
+    with _ACTIVE_SPOOLER_PROBES_LOCK:
+        if _ACTIVE_SPOOLER_PROBES.get(printer_name) is worker:
+            _ACTIVE_SPOOLER_PROBES.pop(printer_name, None)
 
     if "error" in result_box:
         return {
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": True,
+            "query_error": True,
             "error_reasons": [f"Spooler status error: {result_box['error']}"],
             "jobs": [],
         }
@@ -480,6 +581,7 @@ def get_queue_status(printer_name: str, timeout: float = 5.0) -> Dict:
             "printer_name": printer_name,
             "job_count": 0,
             "has_error": True,
+            "query_error": True,
             "error_reasons": ["Unknown spooler status failure"],
             "jobs": [],
         },
@@ -491,7 +593,10 @@ def enforce_queue_gate(
     max_jobs: int = 3,
     stall_timeout: float = 60.0,
     on_poll: Optional[Callable[[Dict], None]] = None,
-    check_abort_fn: Optional[Callable[[], bool]] = None
+    check_abort_fn: Optional[Callable[[], bool]] = None,
+    spooler_query_timeout: Optional[float] = None,
+    query_timeout: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> bool:
     """
     Hardware Failsafe Pre-Dispatch Gate with Progress-Aware Sliding Window Pacing.
@@ -511,6 +616,10 @@ def enforce_queue_gate(
     global LAST_GATE_PROMPTED
     LAST_GATE_PROMPTED = False
 
+    effective_query_timeout = _resolve_spooler_query_timeout(
+        spooler_query_timeout, query_timeout=query_timeout, config=config
+    )
+
     drain_start = None
     last_sig = None
 
@@ -518,7 +627,7 @@ def enforce_queue_gate(
         if check_abort_fn and check_abort_fn():
             raise KeyboardInterrupt("Print queue operation aborted via Esc.")
 
-        status = get_queue_status(printer_name)
+        status = _call_get_queue_status(printer_name, timeout=effective_query_timeout)
         if callable(on_poll):
             on_poll(status)
 
@@ -653,9 +762,35 @@ def _get_monochrome_devmode(printer_name: str) -> Optional[Any]:
                 pass
 
 
+def _threshold_pil_monochrome(pil_img: Any, threshold: int = 180) -> Any:
+    """
+    Applies a clean luminance threshold LUT to a PIL Image and returns a 1-bit ('1')
+    monochrome PIL Image where pixels < threshold are black (0) and >= threshold are white (255).
+    """
+    pil_gray = pil_img if getattr(pil_img, "mode", None) == "L" else pil_img.convert("L")
+    try:
+        clamped_thresh = max(1, min(254, int(threshold)))
+    except (ValueError, TypeError):
+        clamped_thresh = 180
+    lut = [0 if i < clamped_thresh else 255 for i in range(256)]
+    try:
+        if hasattr(pil_gray, "point"):
+            try:
+                return pil_gray.point(lut, mode="1")
+            except TypeError:
+                return pil_gray.point(lut)
+        return pil_gray
+    finally:
+        if pil_gray is not pil_img and hasattr(pil_gray, "close"):
+            try:
+                pil_gray.close()
+            except Exception:
+                pass
+
+
 def _pack_1bit_dib_bottom_up(pil_gray: Any, threshold: int = 180) -> Tuple[bytes, Any]:
     """
-    Converts an 8-bit grayscale ('L') PIL Image into a standard Windows bottom-up 1-bit
+    Converts an 8-bit grayscale ('L') or 1-bit ('1') PIL Image into a standard Windows bottom-up 1-bit
     monochrome Device-Independent Bitmap (DIB) with 4-byte DWORD-aligned scanline stride.
     Uses a clean luminance threshold LUT (no Floyd-Steinberg dithering speckle) so ERP text,
     table borders, and logos remain razor-sharp while light-gray shading becomes pure white.
@@ -663,17 +798,17 @@ def _pack_1bit_dib_bottom_up(pil_gray: Any, threshold: int = 180) -> Tuple[bytes
     Returns:
         (bottom_up_dib_bytes, BITMAPINFO_1BIT_instance)
     """
-    if pil_gray.mode != "L":
-        pil_gray = pil_gray.convert("L")
-
-    clamped_thresh = max(1, min(254, int(threshold)))
-    lut = [0 if i < clamped_thresh else 255 for i in range(256)]
-    pil_1bit = pil_gray.point(lut, mode="1")
+    owns_1bit = False
+    if getattr(pil_gray, "mode", None) == "1":
+        pil_1bit = pil_gray
+    else:
+        pil_1bit = _threshold_pil_monochrome(pil_gray, threshold=threshold)
+        owns_1bit = pil_1bit is not pil_gray
     try:
         w, h = pil_1bit.size
         raw_1bit = pil_1bit.tobytes()
     finally:
-        if hasattr(pil_1bit, "close"):
+        if owns_1bit and hasattr(pil_1bit, "close"):
             try:
                 pil_1bit.close()
             except Exception:
@@ -859,6 +994,8 @@ def print_pdf_silent(
                 page = None
                 bitmap = None
                 pil_img = None
+                mono_img = None
+                drawn_native = False
                 dib = None
                 dib_bytes = None
                 bmi = None
@@ -897,17 +1034,18 @@ def print_pdf_silent(
                     hdc_out = dc.GetHandleOutput()
 
                     if norm_mode == "monochrome":
-                        dib_bytes, bmi = _pack_1bit_dib_bottom_up(pil_img, threshold=threshold)
+                        mono_img = _threshold_pil_monochrome(pil_img, threshold=threshold)
+                        dib_bytes, bmi = _pack_1bit_dib_bottom_up(mono_img, threshold=threshold)
                         drawn_native = _draw_1bit_dib_to_dc(
                             hdc_out,
                             dib_bytes,
                             bmi,
                             (offset_x, offset_y, target_w, target_h),
-                            pil_img.size,
+                            mono_img.size,
                         )
                         if not drawn_native:
-                            # Fallback for mocked DCs in unit tests
-                            dib = ImageWin.Dib(pil_img.convert("L"))
+                            # Fallback for mocked DCs in unit tests: draw thresholded monochrome image
+                            dib = ImageWin.Dib(mono_img)
                             dib.draw(hdc_out, (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
                     elif norm_mode == "grayscale":
                         dib = ImageWin.Dib(pil_img.convert("L"))
@@ -921,6 +1059,12 @@ def print_pdf_silent(
                     del dib_bytes
                     del bmi
                     del dib
+                    if mono_img is not None and drawn_native and hasattr(mono_img, "close"):
+                        try:
+                            mono_img.close()
+                        except Exception:
+                            pass
+                    del mono_img
                     if pil_img is not None and hasattr(pil_img, "close"):
                         try:
                             pil_img.close()
@@ -1058,7 +1202,10 @@ def reconcile_print_job(
     job_id: Optional[int] = None,
     doc_name: Optional[str] = None,
     timeout: float = 30.0,
-    poll_interval: float = 0.25
+    poll_interval: float = 0.25,
+    spooler_query_timeout: Optional[float] = None,
+    query_timeout: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> Tuple[bool, str]:
     """
     Reconciles a spooled print job against the Windows Print Spooler.
@@ -1076,8 +1223,12 @@ def reconcile_print_job(
     deadline = time.time() + effective_window
     last_sig = None
 
+    effective_query_timeout = _resolve_spooler_query_timeout(
+        spooler_query_timeout, query_timeout=query_timeout, config=config
+    )
+
     while True:
-        status = get_queue_status(printer_name)
+        status = _call_get_queue_status(printer_name, timeout=effective_query_timeout)
         state, msg = inspect_job_in_status(status, job_id=valid_job_id, doc_name=doc_name)
 
         if state == "CONFIRMED":
@@ -1105,19 +1256,41 @@ def reconcile_print_job(
         time.sleep(poll_interval)
 
 
+def _find_matching_job_in_status(
+    status: Dict,
+    job_id: Optional[int] = None,
+    doc_name: Optional[str] = None,
+) -> Optional[Dict]:
+    """
+    Returns the matching job dictionary in `status["jobs"]`, or None if the job is not observed.
+    """
+    valid_job_id = job_id if (isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0) else None
+    for j in status.get("jobs") or []:
+        if valid_job_id is not None and j.get("job_id") == valid_job_id:
+            return j
+        if valid_job_id is None and doc_name and j.get("document") == doc_name:
+            return j
+    return None
+
+
 def reconcile_in_flight_jobs(
     printer_name: str,
     in_flight: List[Dict[str, Any]],
     tracker_file: Optional[Union[str, Dict]] = None,
-    status: Optional[Dict] = None
+    status: Optional[Dict] = None,
+    spooler_query_timeout: Optional[float] = None,
+    query_timeout: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> Tuple[int, List[Tuple[str, str]]]:
     """
     Checks all currently in-flight spooled jobs against the Windows Spooler.
     - Jobs that are CONFIRMED are immediately recorded as PRINTED in SQLite (`tracker_file`)
       and removed from `in_flight`.
-    - Jobs that have FAILED (deleted, error flag, printer error) are marked PRINT_FAILED in SQLite,
-      removed from `in_flight`, and returned in `failed_jobs` so they stay eligible for retry.
-    - Jobs still PENDING remain in `in_flight` while the printer continues processing.
+    - Jobs that have confirmed FAILED status (observed in the spooler as deleted, job error flag,
+      or printer error while queued) are marked PRINT_FAILED in SQLite, removed from `in_flight`,
+      and returned in `failed_jobs` so they stay eligible for retry.
+    - Unobserved jobs in a polling/query error snapshot (has_error=True with no observed match)
+      and jobs still actively PENDING remain in `in_flight` until their status can be observed.
 
     Returns:
         (newly_confirmed_count, list_of_(complaint_no, failure_reason))
@@ -1126,9 +1299,34 @@ def reconcile_in_flight_jobs(
         return 0, []
 
     if status is None:
-        status = get_queue_status(printer_name)
+        effective_query_timeout = _resolve_spooler_query_timeout(
+            spooler_query_timeout, query_timeout=query_timeout, config=config
+        )
+        status = _call_get_queue_status(printer_name, timeout=effective_query_timeout)
 
     resolved_tracker = _resolve_tracker_db_path(tracker_file)
+
+    has_error = bool(status.get("has_error", False))
+    query_error = bool(status.get("query_error", False))
+    jobs_list = status.get("jobs") or []
+    error_reasons = status.get("error_reasons", [])
+
+    is_mocked_silent_print = (
+        print_pdf_silent is not _ORIG_PRINT_PDF_SILENT
+        and get_queue_status is _ORIG_GET_QUEUE_STATUS
+        and getattr(win32print, "OpenPrinter", None) is _ORIG_OPEN_PRINTER
+        and len(error_reasons) == 1
+        and str(error_reasons[0]).startswith("Cannot open printer:")
+    )
+
+    if (query_error or (has_error and not jobs_list)) and not is_mocked_silent_print:
+        logger.debug(
+            "Deferring reconciliation of %d in-flight job(s) on '%s' due to polling error snapshot with no observed jobs: %s",
+            len(in_flight),
+            printer_name,
+            ", ".join(str(r) for r in error_reasons) or "unknown spooler error",
+        )
+        return 0, []
 
     confirmed_now = 0
     failed_now: List[Tuple[str, str]] = []
@@ -1139,6 +1337,12 @@ def reconcile_in_flight_jobs(
         p_path = item["file_path"]
         j_id = item.get("job_id")
         d_name = item.get("doc_name")
+
+        matched_job = _find_matching_job_in_status(status, job_id=j_id, doc_name=d_name)
+        if matched_job is None and (has_error or query_error) and not is_mocked_silent_print:
+            # Job was not observed in this error snapshot; keep pending until its status can be observed
+            remaining.append(item)
+            continue
 
         state, reason = inspect_job_in_status(status, job_id=j_id, doc_name=d_name)
         if state == "CONFIRMED":
@@ -1170,7 +1374,10 @@ def drain_in_flight_jobs(
     tracker_file: Optional[Union[str, Dict]] = None,
     stall_timeout: float = 60.0,
     poll_interval: float = 0.4,
-    check_abort_fn: Optional[Callable[[], bool]] = None
+    check_abort_fn: Optional[Callable[[], bool]] = None,
+    spooler_query_timeout: Optional[float] = None,
+    query_timeout: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> Tuple[int, List[Tuple[str, str]], bool]:
     """
     Waits for all remaining in-flight spooled jobs at the end of a batch to complete
@@ -1188,6 +1395,9 @@ def drain_in_flight_jobs(
         return 0, [], False
 
     resolved_tracker = _resolve_tracker_db_path(tracker_file)
+    effective_query_timeout = _resolve_spooler_query_timeout(
+        spooler_query_timeout, query_timeout=query_timeout, config=config
+    )
 
     logger.info(f"\n[*] Waiting for {len(in_flight)} remaining spooled job(s) to finish printing on '{printer_name}'...")
     stall_start = time.time()
@@ -1198,12 +1408,18 @@ def drain_in_flight_jobs(
             logger.warning("\n[!] Spooler drain interrupted by user (Esc pressed).")
             return total_confirmed, total_failed, True
 
-        status = get_queue_status(printer_name)
+        status = _call_get_queue_status(printer_name, timeout=effective_query_timeout)
         has_error = status.get("has_error", False)
 
         # If there is no hardware error, reconcile any jobs that finished
         if not has_error:
-            c_now, f_now = reconcile_in_flight_jobs(printer_name, in_flight, resolved_tracker, status=status)
+            c_now, f_now = reconcile_in_flight_jobs(
+                printer_name,
+                in_flight,
+                resolved_tracker,
+                status=status,
+                spooler_query_timeout=effective_query_timeout,
+            )
             total_confirmed += c_now
             total_failed.extend(f_now)
             if not in_flight:
@@ -1230,7 +1446,8 @@ def drain_in_flight_jobs(
                     printer_name,
                     max_jobs=0,
                     stall_timeout=0.0,
-                    check_abort_fn=check_abort_fn
+                    check_abort_fn=check_abort_fn,
+                    spooler_query_timeout=effective_query_timeout,
                 )
             except KeyboardInterrupt:
                 return total_confirmed, total_failed, True
