@@ -143,7 +143,20 @@ def _dispatch_live_print(num, file_path, config, timings):
     try:
         doc_name = f"Complaint_{num}.pdf"
         logger.info(f"[*] Sending '{num}.pdf' to '{target_printer}'...")
-        job_id = pm.print_pdf_silent(file_path, target_printer, doc_name=doc_name)
+        print_dpi = printing_cfg.get("print_dpi", 200)
+        color_mode = printing_cfg.get("color_mode", "monochrome")
+        mono_threshold = printing_cfg.get("monochrome_threshold", 180)
+        try:
+            job_id = pm.print_pdf_silent(
+                file_path,
+                target_printer,
+                dpi=print_dpi,
+                doc_name=doc_name,
+                color_mode=color_mode,
+                threshold=mono_threshold,
+            )
+        except TypeError:
+            job_id = pm.print_pdf_silent(file_path, target_printer, doc_name=doc_name)
         if not job_id:
             raise RuntimeError("Silent print did not return a valid spool job.")
         pm.mark_complaint_spooled(

@@ -1,8 +1,8 @@
-# Oracle ERP Automation Suite (v6.1.0: In-App Self-Updater, Enterprise SQLite State, Logging & Silent Printing)
+# Oracle ERP Automation Suite (v6.1.1: In-App Self-Updater, Enterprise SQLite State, Logging & Silent Printing)
 
 An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
 
-## Key Enterprise Features (v6.1.0)
+## Key Enterprise Features (v6.1.1)
 - **In-App Self-Updater & Atomic Binary Swap (`updater.py`, `version.py`)**:
   - Performs a fast (3-second timeout) non-blocking update check against GitHub Releases on startup and offers an on-demand **`[U] Check for Updates`** menu option.
   - Downloads release archives (`ERP_Automation_Suite_vX.Y.Z.zip`), verifies SHA-256 checksum integrity, and spawns a detached Windows helper (`_run_update.bat`) that waits for the active process to exit (`tasklist`), atomically replaces `ERP_Automation_Suite.exe` and `_internal/` with rollback protection, and restarts automatically while strictly preserving `config.json`, `complaints_state.db`, `complaints.xlsx`, `Today_Complaints/`, and `logs/`.
@@ -84,13 +84,13 @@ python -B build.py
 # Or build and automatically publish the GitHub Release via GitHub CLI:
 python -B build.py --publish
 ```
-This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` while preserving existing `config.json`, `complaints.xlsx`, `complaints_state.db`, `logs/`, and `Today_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.1.0.zip` + `.sha256` checksum.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` while preserving existing `config.json`, `complaints.xlsx`, `complaints_state.db`, `logs/`, and `Today_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.1.1.zip` + `.sha256` checksum.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
 | `main.py` | Entry point, CLI menu router (`[1]`–`[7]`, `[U]`), strict Excel validation & Pre-Flight Summary, and Batch Print mode `[5]`. |
-| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.1.0"`), SemVer comparisons, and release asset naming. |
+| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.1.1"`), SemVer comparisons, and release asset naming. |
 | `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper. |
 | `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, and legacy `.txt` auto-migrator. |
 | `logger_manager.py` | Centralized logging manager with `RotatingFileHandler` (`logs/app.log`, 5 MB x 5 backups), console stream formatting, and crash hook. |

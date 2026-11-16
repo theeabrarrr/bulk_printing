@@ -42,7 +42,11 @@
     "printer_name": "HP LaserJet 400 M401 PCL 6 (Copy 1)",
     "max_spool_queue": 3,
     "enable_live_print": false,
-    "printed_tracker_file": "printed_complaints.txt"
+    "printed_tracker_file": "printed_complaints.txt",
+    "print_dpi": 200,
+    "color_mode": "monochrome",
+    "monochrome_threshold": 180,
+    "spooler_query_timeout": 5.0
   },
   "logging": {
     "log_dir": "logs",

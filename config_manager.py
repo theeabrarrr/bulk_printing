@@ -48,7 +48,11 @@ DEFAULT_CONFIG = {
         "printer_name": None,
         "max_spool_queue": 3,
         "enable_live_print": False,
-        "printed_tracker_file": "printed_complaints.txt"
+        "printed_tracker_file": "printed_complaints.txt",
+        "print_dpi": 200,
+        "color_mode": "monochrome",
+        "monochrome_threshold": 180,
+        "spooler_query_timeout": 5.0
     },
     "logging": {
         "log_dir": "logs",
@@ -265,6 +269,32 @@ def get_printing_settings(config=None):
         merged["max_spool_queue"] = 3
 
     merged["enable_live_print"] = bool(merged.get("enable_live_print", False))
+
+    try:
+        merged["print_dpi"] = max(100, min(600, int(merged.get("print_dpi", 200))))
+    except (ValueError, TypeError):
+        merged["print_dpi"] = 200
+
+    raw_mode = str(merged.get("color_mode") or "monochrome").strip().lower()
+    if raw_mode in ("monochrome", "1bit", "1-bit", "bw", "b&w"):
+        merged["color_mode"] = "monochrome"
+    elif raw_mode in ("grayscale", "greyscale", "gray", "grey", "l"):
+        merged["color_mode"] = "grayscale"
+    elif raw_mode in ("rgb", "color", "colour"):
+        merged["color_mode"] = "rgb"
+    else:
+        merged["color_mode"] = "monochrome"
+
+    try:
+        merged["monochrome_threshold"] = max(1, min(254, int(merged.get("monochrome_threshold", 180))))
+    except (ValueError, TypeError):
+        merged["monochrome_threshold"] = 180
+
+    try:
+        merged["spooler_query_timeout"] = max(0.5, float(merged.get("spooler_query_timeout", 5.0)))
+    except (ValueError, TypeError):
+        merged["spooler_query_timeout"] = 5.0
+
     return merged
 
 def get_logging_settings(config=None):

@@ -1,16 +1,21 @@
 """
 printer_manager.py
 Modular Print Manager for Universal Silent Printing & Windows Spooler Queue Monitoring.
-Uses in-process headless GDI rendering (pypdfium2 + win32ui) for zero-popup physical printing.
+Uses in-process headless GDI rendering (pypdfium2 + 1-bit monochrome GDI StretchDIBits)
+for lightweight (<1 MB/page), zero-popup physical printing that prevents PCL XL buffer overflows.
 Persists spooler & print job state via state_manager (SQLite complaints_state.db).
 """
 
+import ctypes
 import gc
 import os
 import sys
+import threading
 import time
 import winsound
 from typing import List, Dict, Optional, Set, Tuple, Callable, Any, Union
+
+GDI_ERROR = 0xFFFFFFFF
 
 if sys.platform == "win32":
     try:
@@ -28,14 +33,73 @@ if sys.platform == "win32":
         win32timezone = None
     from PIL import Image, ImageWin
     import pypdfium2 as pdfium
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", ctypes.c_uint32),
+            ("biWidth", ctypes.c_int32),
+            ("biHeight", ctypes.c_int32),
+            ("biPlanes", ctypes.c_uint16),
+            ("biBitCount", ctypes.c_uint16),
+            ("biCompression", ctypes.c_uint32),
+            ("biSizeImage", ctypes.c_uint32),
+            ("biXPelsPerMeter", ctypes.c_int32),
+            ("biYPelsPerMeter", ctypes.c_int32),
+            ("biClrUsed", ctypes.c_uint32),
+            ("biClrImportant", ctypes.c_uint32),
+        ]
+
+    class RGBQUAD(ctypes.Structure):
+        _fields_ = [
+            ("rgbBlue", ctypes.c_ubyte),
+            ("rgbGreen", ctypes.c_ubyte),
+            ("rgbRed", ctypes.c_ubyte),
+            ("rgbReserved", ctypes.c_ubyte),
+        ]
+
+    class BITMAPINFO_1BIT(ctypes.Structure):
+        _fields_ = [
+            ("bmiHeader", BITMAPINFOHEADER),
+            ("bmiColors", RGBQUAD * 2),
+        ]
+
+    try:
+        _gdi32 = ctypes.windll.gdi32
+        _gdi32.StretchDIBits.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint32,
+        ]
+        _gdi32.StretchDIBits.restype = ctypes.c_int
+        _gdi32.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _gdi32.SetStretchBltMode.restype = ctypes.c_int
+        _gdi32.GetObjectType.argtypes = [ctypes.c_void_p]
+        _gdi32.GetObjectType.restype = ctypes.c_uint32
+    except Exception:
+        _gdi32 = None
 else:
     win32print = None
     win32ui = None
     win32con = None
     win32gui = None
     win32timezone = None
+    Image = None
     ImageWin = None
     pdfium = None
+    BITMAPINFOHEADER = None
+    RGBQUAD = None
+    BITMAPINFO_1BIT = None
+    _gdi32 = None
 
 import logger_manager
 import state_manager
@@ -257,19 +321,19 @@ def _get_job_error_flags() -> Dict[int, str]:
     }
 
 
-def get_queue_status(printer_name: str) -> Dict:
+def _query_queue_status_raw(printer_name: str) -> Dict:
     """
-    Queries the Windows Print Spooler for active jobs and status flags on target printer.
-    Returns:
-        Dict containing:
-            - printer_name (str)
-            - job_count (int)
-            - has_error (bool)
-            - error_reasons (List[str])
-            - jobs (List[Dict])
+    Synchronous Win32 Print Spooler status query worker.
+    Invoked inside a timeout-guarded daemon thread by `get_queue_status`.
     """
     if not win32print:
-        return {"printer_name": printer_name, "job_count": 0, "has_error": False, "error_reasons": ["Non-Windows OS"], "jobs": []}
+        return {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": False,
+            "error_reasons": ["Non-Windows OS"],
+            "jobs": [],
+        }
 
     try:
         h_printer = win32print.OpenPrinter(printer_name)
@@ -279,7 +343,7 @@ def get_queue_status(printer_name: str) -> Dict:
             "job_count": 0,
             "has_error": True,
             "error_reasons": [f"Cannot open printer: {e}"],
-            "jobs": []
+            "jobs": [],
         }
 
     try:
@@ -291,7 +355,7 @@ def get_queue_status(printer_name: str) -> Dict:
                 "job_count": 0,
                 "has_error": True,
                 "error_reasons": [f"Cannot query printer status: {e}"],
-                "jobs": []
+                "jobs": [],
             }
 
         c_jobs = p_info.get("cJobs", 0)
@@ -336,13 +400,90 @@ def get_queue_status(printer_name: str) -> Dict:
                     "document": j.get("pDocument"),
                     "status": j.get("Status"),
                     "pages": j.get("TotalPages"),
-                    "pages_printed": j.get("PagesPrinted", 0)
+                    "pages_printed": j.get("PagesPrinted", 0),
                 }
                 for j in jobs
-            ]
+            ],
         }
     finally:
-        win32print.ClosePrinter(h_printer)
+        try:
+            win32print.ClosePrinter(h_printer)
+        except Exception:
+            pass
+
+
+def get_queue_status(printer_name: str, timeout: float = 5.0) -> Dict:
+    """
+    Queries the Windows Print Spooler for active jobs and status flags on target printer.
+    Guarded by a non-blocking daemon worker thread so hung Windows Spooler RPC calls
+    (e.g., when spoolsv.exe or a USB port monitor stalls) never deadlock the main thread
+    or block [ESC] / [Q] failsafe aborts.
+
+    Returns:
+        Dict containing:
+            - printer_name (str)
+            - job_count (int)
+            - has_error (bool)
+            - error_reasons (List[str])
+            - jobs (List[Dict])
+    """
+    if not win32print:
+        return {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": False,
+            "error_reasons": ["Non-Windows OS"],
+            "jobs": [],
+        }
+
+    if timeout is None or timeout <= 0:
+        return _query_queue_status_raw(printer_name)
+
+    result_box: Dict[str, Any] = {}
+
+    def _worker():
+        try:
+            result_box["data"] = _query_queue_status_raw(printer_name)
+        except Exception as exc:
+            result_box["error"] = exc
+
+    worker = threading.Thread(target=_worker, name="SpoolerStatusProbe", daemon=True)
+    worker.start()
+    worker.join(timeout=float(timeout))
+
+    if worker.is_alive():
+        reason = (
+            f"Spooler API timed out after {float(timeout):.1f}s "
+            "(printer driver or Windows Spooler may be hung)"
+        )
+        logger.warning("Spooler query timeout on '%s': %s", printer_name, reason)
+        return {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": True,
+            "error_reasons": [reason],
+            "jobs": [],
+        }
+
+    if "error" in result_box:
+        return {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": True,
+            "error_reasons": [f"Spooler status error: {result_box['error']}"],
+            "jobs": [],
+        }
+
+    return result_box.get(
+        "data",
+        {
+            "printer_name": printer_name,
+            "job_count": 0,
+            "has_error": True,
+            "error_reasons": ["Unknown spooler status failure"],
+            "jobs": [],
+        },
+    )
 
 
 def enforce_queue_gate(
@@ -476,9 +617,166 @@ def enforce_queue_gate(
         time.sleep(1.0)
 
 
-def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name: Optional[str] = None) -> int:
+def _get_monochrome_devmode(printer_name: str) -> Optional[Any]:
+    """
+    Retrieves the printer's DEVMODE structure, sets DMCOLOR_MONOCHROME, and invokes
+    win32print.DocumentProperties(DM_IN_BUFFER | DM_OUT_BUFFER) so drivers with private
+    DriverExtra blocks (e.g., HP PCL 6 / hpcpp117) synchronize internal color state to
+    monochrome without requiring manual Windows Control Panel tweaks.
+    """
+    if not win32print or not win32con or not printer_name:
+        return None
+
+    h_printer = None
+    try:
+        h_printer = win32print.OpenPrinter(printer_name)
+        info = win32print.GetPrinter(h_printer, 2)
+        dm = info.get("pDevMode") if isinstance(info, dict) else None
+        if dm is None:
+            return None
+
+        dm.Color = getattr(win32con, "DMCOLOR_MONOCHROME", 1)
+        dm.Fields |= getattr(win32con, "DM_COLOR", 0x00000800)
+
+        if hasattr(win32print, "DocumentProperties"):
+            flags = getattr(win32con, "DM_IN_BUFFER", 8) | getattr(win32con, "DM_OUT_BUFFER", 2)
+            win32print.DocumentProperties(0, h_printer, printer_name, dm, dm, flags)
+        return dm
+    except Exception as e:
+        logger.debug("Could not negotiate monochrome DEVMODE for '%s': %s", printer_name, e)
+        return None
+    finally:
+        if h_printer is not None:
+            try:
+                win32print.ClosePrinter(h_printer)
+            except Exception:
+                pass
+
+
+def _pack_1bit_dib_bottom_up(pil_gray: Any, threshold: int = 180) -> Tuple[bytes, Any]:
+    """
+    Converts an 8-bit grayscale ('L') PIL Image into a standard Windows bottom-up 1-bit
+    monochrome Device-Independent Bitmap (DIB) with 4-byte DWORD-aligned scanline stride.
+    Uses a clean luminance threshold LUT (no Floyd-Steinberg dithering speckle) so ERP text,
+    table borders, and logos remain razor-sharp while light-gray shading becomes pure white.
+
+    Returns:
+        (bottom_up_dib_bytes, BITMAPINFO_1BIT_instance)
+    """
+    if pil_gray.mode != "L":
+        pil_gray = pil_gray.convert("L")
+
+    clamped_thresh = max(1, min(254, int(threshold)))
+    lut = [0 if i < clamped_thresh else 255 for i in range(256)]
+    pil_1bit = pil_gray.point(lut, mode="1")
+    try:
+        w, h = pil_1bit.size
+        raw_1bit = pil_1bit.tobytes()
+    finally:
+        if hasattr(pil_1bit, "close"):
+            try:
+                pil_1bit.close()
+            except Exception:
+                pass
+        del pil_1bit
+
+    row_bytes = (w + 7) // 8
+    stride = (row_bytes + 3) & ~3
+    pad = b"\x00" * (stride - row_bytes)
+
+    # Standard bottom-up scanline order (row h-1 first, row 0 last) for universal Win32 GDI compatibility
+    bottom_up_bytes = b"".join(
+        raw_1bit[r * row_bytes : (r + 1) * row_bytes] + pad
+        for r in range(h - 1, -1, -1)
+    )
+
+    bmi = None
+    if BITMAPINFO_1BIT is not None and BITMAPINFOHEADER is not None and RGBQUAD is not None:
+        bmi = BITMAPINFO_1BIT()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = h  # Positive height = standard bottom-up DIB
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 1
+        bmi.bmiHeader.biCompression = getattr(win32con, "BI_RGB", 0)
+        bmi.bmiHeader.biSizeImage = len(bottom_up_bytes)
+        bmi.bmiHeader.biXPelsPerMeter = 0
+        bmi.bmiHeader.biYPelsPerMeter = 0
+        bmi.bmiHeader.biClrUsed = 2
+        bmi.bmiHeader.biClrImportant = 2
+        # Palette index 0 = Black (0,0,0), index 1 = White (255,255,255)
+        bmi.bmiColors[0] = RGBQUAD(0, 0, 0, 0)
+        bmi.bmiColors[1] = RGBQUAD(255, 255, 255, 0)
+
+    return bottom_up_bytes, bmi
+
+
+def _draw_1bit_dib_to_dc(
+    hdc: Any,
+    dib_bytes: bytes,
+    bmi: Any,
+    dst_rect: Tuple[int, int, int, int],
+    src_size: Tuple[int, int],
+) -> bool:
+    """
+    Streams a packed 1-bit monochrome DIB directly into a Windows GDI Printer HDC
+    using gdi32.StretchDIBits with BLACKONWHITE scanline preservation.
+    Returns True if rendered via native GDI StretchDIBits, or False if hdc is a mock/non-GDI handle.
+    """
+    if _gdi32 is None or bmi is None or not isinstance(hdc, int):
+        return False
+
+    try:
+        obj_type = _gdi32.GetObjectType(hdc)
+    except Exception:
+        obj_type = 0
+
+    if obj_type == 0:
+        # Handle is a unit-test mock integer rather than a live Win32 GDI HDC
+        return False
+
+    dst_x, dst_y, dst_w, dst_h = dst_rect
+    src_w, src_h = src_size
+
+    try:
+        # BLACKONWHITE (STRETCH_ANDSCANS = 1) preserves black text/lines over white background
+        _gdi32.SetStretchBltMode(hdc, getattr(win32con, "BLACKONWHITE", 1))
+    except Exception:
+        pass
+
+    scanlines = _gdi32.StretchDIBits(
+        hdc,
+        dst_x,
+        dst_y,
+        dst_w,
+        dst_h,
+        0,
+        0,
+        src_w,
+        src_h,
+        dib_bytes,
+        ctypes.byref(bmi),
+        getattr(win32con, "DIB_RGB_COLORS", 0),
+        getattr(win32con, "SRCCOPY", 0x00CC0020),
+    )
+    if scanlines <= 0 or (scanlines & 0xFFFFFFFF) == GDI_ERROR:
+        raise RuntimeError(f"gdi32.StretchDIBits failed (returned {scanlines})")
+    return True
+
+
+def print_pdf_silent(
+    pdf_path: str,
+    printer_name: str,
+    dpi: int = 200,
+    doc_name: Optional[str] = None,
+    color_mode: str = "monochrome",
+    threshold: int = 180,
+) -> int:
     """
     Renders PDF pages directly into the Windows GDI Printer Device Context using pypdfium2.
+    By default, uses single-channel grayscale PDFium rendering + true 1-bit monochrome GDI
+    StretchDIBits (< 0.5 MB/page at 200 DPI, < 1.1 MB/page at 300 DPI) and negotiates
+    DMCOLOR_MONOCHROME in the printer DEVMODE to eliminate PCL XL buffer overflows.
     Completely silent, zero window pop-ups, zero external dependencies.
     Explicitly releases native pypdfium2 bitmaps/pages/documents and Windows GDI DC handles
     after each page/document to guarantee flat memory usage across large batches.
@@ -487,8 +785,10 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
     Args:
         pdf_path: Absolute or relative path to the PDF document.
         printer_name: Target Windows printer name.
-        dpi: Target rasterization resolution (default: 300 DPI for high-quality text/graphics).
+        dpi: Target rasterization resolution (default: 200 DPI for lightweight, sharp ERP text).
         doc_name: Optional document title displayed in the Windows spooler.
+        color_mode: 'monochrome' (default, 1-bit GDI StretchDIBits), 'grayscale' (8-bit L), or 'rgb' (24-bit RGB).
+        threshold: Luminance threshold (1-254, default 180) when converting grayscale to 1-bit monochrome.
 
     Returns:
         Positive integer job_id (or True if driver returned non-positive ID) when spooled;
@@ -505,6 +805,18 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
 
     if not doc_name:
         doc_name = os.path.basename(pdf_path)
+
+    norm_mode = str(color_mode or "monochrome").strip().lower()
+    if norm_mode in ("1bit", "1-bit", "bw", "b&w", "monochrome"):
+        norm_mode = "monochrome"
+    elif norm_mode in ("grayscale", "greyscale", "gray", "grey", "l"):
+        norm_mode = "grayscale"
+    elif norm_mode in ("rgb", "color", "colour"):
+        norm_mode = "rgb"
+    else:
+        norm_mode = "monochrome"
+
+    effective_dpi = max(100, min(600, int(dpi or 200)))
 
     # Open PDF document
     pdf = pdfium.PdfDocument(pdf_path)
@@ -525,6 +837,15 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
             del dc
             raise RuntimeError(f"Failed to create Printer Device Context for '{printer_name}': {e}")
 
+        # Programmatically negotiate DMCOLOR_MONOCHROME on the printer DC when not printing RGB
+        if norm_mode != "rgb" and win32gui is not None and hasattr(win32gui, "ResetDC"):
+            mono_dm = _get_monochrome_devmode(printer_name)
+            if mono_dm is not None:
+                try:
+                    win32gui.ResetDC(dc.GetHandleOutput(), mono_dm)
+                except Exception as dm_err:
+                    logger.debug("ResetDC monochrome DEVMODE skipped on '%s': %s", printer_name, dm_err)
+
         try:
             # Printable area of target printer (pixels at printer resolution)
             printable_w = dc.GetDeviceCaps(win32con.HORZRES)
@@ -539,6 +860,8 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
                 bitmap = None
                 pil_img = None
                 dib = None
+                dib_bytes = None
+                bmi = None
                 try:
                     page = pdf[page_idx]
                     page_w, page_h = page.get_size()
@@ -555,17 +878,48 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
                     offset_x = (printable_w - target_w) // 2
                     offset_y = (printable_h - target_h) // 2
 
-                    # Render page to high-DPI bitmap
-                    scale = dpi / 72.0
-                    bitmap = page.render(scale=scale)
-                    pil_img = bitmap.to_pil().convert("RGB")
-                    dib = ImageWin.Dib(pil_img)
+                    scale = effective_dpi / 72.0
+                    use_gray_render = norm_mode in ("monochrome", "grayscale")
+                    try:
+                        bitmap = page.render(
+                            scale=scale,
+                            grayscale=use_gray_render,
+                            optimize_mode="print",
+                        )
+                    except TypeError:
+                        # Fallback if a mocked page.render in tests only accepts `scale`
+                        bitmap = page.render(scale=scale)
+
+                    pil_img = bitmap.to_pil()
 
                     # Stream into printer DC
                     dc.StartPage()
-                    dib.draw(dc.GetHandleOutput(), (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
+                    hdc_out = dc.GetHandleOutput()
+
+                    if norm_mode == "monochrome":
+                        dib_bytes, bmi = _pack_1bit_dib_bottom_up(pil_img, threshold=threshold)
+                        drawn_native = _draw_1bit_dib_to_dc(
+                            hdc_out,
+                            dib_bytes,
+                            bmi,
+                            (offset_x, offset_y, target_w, target_h),
+                            pil_img.size,
+                        )
+                        if not drawn_native:
+                            # Fallback for mocked DCs in unit tests
+                            dib = ImageWin.Dib(pil_img.convert("L"))
+                            dib.draw(hdc_out, (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
+                    elif norm_mode == "grayscale":
+                        dib = ImageWin.Dib(pil_img.convert("L"))
+                        dib.draw(hdc_out, (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
+                    else:
+                        dib = ImageWin.Dib(pil_img.convert("RGB"))
+                        dib.draw(hdc_out, (offset_x, offset_y, offset_x + target_w, offset_y + target_h))
+
                     dc.EndPage()
                 finally:
+                    del dib_bytes
+                    del bmi
                     del dib
                     if pil_img is not None and hasattr(pil_img, "close"):
                         try:
@@ -587,7 +941,15 @@ def print_pdf_silent(pdf_path: str, printer_name: str, dpi: int = 300, doc_name:
                     del page
 
             dc.EndDoc()
-            logger.debug("Spooled '%s' (%d page(s)) to '%s' (job_id=%s).", pdf_path, total_pages, printer_name, job_id)
+            logger.debug(
+                "Spooled '%s' (%d page(s), mode=%s, dpi=%d) to '%s' (job_id=%s).",
+                pdf_path,
+                total_pages,
+                norm_mode,
+                effective_dpi,
+                printer_name,
+                job_id,
+            )
             if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
                 LAST_SPOOLED_JOB_ID = job_id
                 return job_id

@@ -931,7 +931,20 @@ def run_batch_print_mode(config):
 
                 try:
                     doc_name = f"Complaint_{c_num}.pdf"
-                    job_id = printer_manager.print_pdf_silent(p_path, target_printer, doc_name=doc_name)
+                    print_dpi = printing_settings.get("print_dpi", 200)
+                    color_mode = printing_settings.get("color_mode", "monochrome")
+                    mono_threshold = printing_settings.get("monochrome_threshold", 180)
+                    try:
+                        job_id = printer_manager.print_pdf_silent(
+                            p_path,
+                            target_printer,
+                            dpi=print_dpi,
+                            doc_name=doc_name,
+                            color_mode=color_mode,
+                            threshold=mono_threshold,
+                        )
+                    except TypeError:
+                        job_id = printer_manager.print_pdf_silent(p_path, target_printer, doc_name=doc_name)
                     if not job_id:
                         raise RuntimeError("Silent print did not return a valid spool job.")
                     printer_manager.mark_complaint_spooled(
