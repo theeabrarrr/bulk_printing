@@ -1,6 +1,6 @@
 # Oracle ERP Automation Suite (v6.1.2: In-App Self-Updater, Enterprise SQLite State, Logging & Silent Printing)
 
-An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
+An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), stamps technician remarks onto matching PDFs (`Stamped_Complaints/`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
 
 ## Key Enterprise Features (v6.1.2)
 - **In-App Self-Updater & Atomic Binary Swap (`updater.py`, `version.py`)**:
@@ -18,6 +18,10 @@ An automated RPA (Robotic Process Automation) application that extracts complain
 - **100% Invisible Headless GDI Rendering & Spooler Queue Monitoring**:
   - Uses `pypdfium2` and Windows GDI Printer Device Contexts (`win32ui`/`win32print`) to stream pages directly into the Windows Print Spooler without external PDF viewer pop-ups.
   - Pauses with audible alarms if the spooler queue stalls or reports hardware errors (paper jam, out-of-paper, offline, paused).
+- **Batch Technician Remarks PDF Stamping (`pdf_remarks.py`)**:
+  - Reads `COMPLAINT_NO` and `REMARKS` from `complaint_remarks.xlsx` (normalizing headers, stripping `.0` float suffixes, skipping blank remarks, and keeping the last non-empty remark for duplicate IDs with row-level warnings).
+  - Recursively scans `Today_Complaints/` (or a custom input folder), dynamically anchors vertically to the Technician Remarks border (compensating for layout-shifted forms), and transparently overlays wrapped Regular Helvetica text (`9.5 pt` auto-scaling down to `6.0 pt` in `0.5 pt` steps, with word-boundary `...` truncation fallback) without altering existing PDF lines or layout.
+  - Writes matched stamped PDFs atomically into mirrored technician subfolders under `Stamped_Complaints/` and exports a timestamped CSV report (`logs/remarks_report_YYYYMMDD_HHMMSS.csv`) whenever missing PDFs, truncated remarks, or errors occur.
 
 ---
 
@@ -28,9 +32,11 @@ Ensure the following items are in the `ERP_Automation_Suite` folder:
 - `ERP_Automation_Suite.exe` — The main application (double-click to run).
 - `config.json` — Stores calibrated screen coordinates (5 Print + 4 OTP targets), printer preferences, logging rules, and timing thresholds.
 - `complaints.xlsx` — Your daily Excel export containing `COMPLAINT_NO` and `TECHNICIAN_NAME` columns.
+- `complaint_remarks.xlsx` — Optional remarks Excel workbook containing `COMPLAINT_NO` and `REMARKS` columns (used by Menu `[7]`).
 - `complaints_state.db` — SQLite database automatically tracking downloaded, spooled, and printed complaints so interrupted runs resume seamlessly.
 - `logs/app.log` — Rotating technical log file for troubleshooting and audit history.
 - `Today_Complaints/` — Output folder where sorted technician PDFs are saved.
+- `Stamped_Complaints/` — Output folder where remarks-stamped PDFs are written in mirrored technician subfolders.
 
 ### 2. Running the Bot
 1. Open your Oracle Forms ERP application and maximize the window.
@@ -41,10 +47,11 @@ Ensure the following items are in the `ERP_Automation_Suite` folder:
    - **`[2] Manual Mode (Process single/batch complaint #s)`**: Prompts for one or multiple comma/space-separated complaint numbers (e.g. `2826001 2826002, 2826003`), deduplicates them, and processes them sequentially with optional live physical printing.
    - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard to calibrate screen coordinates or configure physical printer and queue limits.
    - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint numbers and automates OTP generation in Oracle Forms in a continuous loop.
-   - **`[5] Batch Print Offline PDFs (Today_Complaints)`**: Lists Technician folders inside `Today_Complaints/` with `[Total | Printed | Pending]` counts backed by `complaints_state.db`, lets you pick one or more folders (or all), and silent-prints unprinted documents using a progress-aware sliding-window spooler pipeline.
+   - **`[5] Batch Print Offline PDFs (Today_Complaints / Stamped)`**: Lists Technician folders with `[Total | Printed | Pending]` counts backed by `complaints_state.db`, lets you select or switch (`[S]`) between `Today_Complaints/` (original) and `Stamped_Complaints/` (with technician remarks), and silent-prints unprinted documents using a progress-aware sliding-window spooler pipeline.
    - **`[6] Select / Change Target Printer`**: Lists installed Windows printers and updates the configured target printer in `config.json`.
+   - **`[7] Stamp Technician Remarks onto PDFs`**: Prompts (press `[Enter]` for defaults) for `complaint_remarks.xlsx`, input PDF folder (`Today_Complaints/`), and output folder (`Stamped_Complaints/`), displays the Remarks Excel Pre-Flight Validation Summary, and batch-stamps matched PDFs into mirrored technician subfolders.
    - **`[U] Check for Updates`**: Checks GitHub Releases for a newer version and performs a verified, state-preserving in-place update and restart.
-   - **`[7] Exit`**: Closes the program.
+   - **`[8] Exit`**: Closes the program.
 
 ---
 
@@ -84,18 +91,19 @@ python -B build.py
 # Or build and automatically publish the GitHub Release via GitHub CLI:
 python -B build.py --publish
 ```
-This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` while preserving existing `config.json`, `complaints.xlsx`, `complaints_state.db`, `logs/`, and `Today_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.1.2.zip` + `.sha256` checksum.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` (bundling `pypdfium2` and `pymupdf`) while preserving existing `config.json`, `complaints.xlsx`, `complaint_remarks.xlsx`, `complaints_state.db`, `logs/`, `Today_Complaints/`, and `Stamped_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.1.2.zip` + `.sha256` checksum.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
-| `main.py` | Entry point, CLI menu router (`[1]`–`[7]`, `[U]`), strict Excel validation & Pre-Flight Summary, and Batch Print mode `[5]`. |
+| `main.py` | Entry point, CLI menu router (`[1]`–`[8]`, `[U]`), strict Excel validation & Pre-Flight Summary, Batch Remarks Stamping `[7]`, and Batch Print mode `[5]` (`Today_Complaints` / `Stamped_Complaints`). |
+| `pdf_remarks.py` | PyMuPDF batch remarks stamping engine: Excel validation, dynamic border anchoring, font auto-scaling (`9.5`–`6.0 pt`) with word-boundary truncation, atomic saves, and CSV issue reporting. |
 | `version.py` | Single source of truth for semantic versioning (`__version__ = "6.1.2"`), SemVer comparisons, and release asset naming. |
-| `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper. |
+| `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper (preserving `Stamped_Complaints/` and `complaint_remarks.xlsx`). |
 | `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, and legacy `.txt` auto-migrator. |
 | `logger_manager.py` | Centralized logging manager with `RotatingFileHandler` (`logs/app.log`, 5 MB x 5 backups), console stream formatting, and crash hook. |
 | `printer_manager.py` | Modular printing engine: printer enumeration, spooler queue monitoring, queue gate failsafe, headless GDI printing, and job reconciliation. |
-| `config_manager.py` | Portable path anchoring (`sys.executable`), Per-Monitor DPI awareness, and unified schema validation. |
+| `config_manager.py` | Portable path anchoring (`sys.executable`), Per-Monitor DPI awareness, and unified schema validation (`coordinates`, `timings`, `settings`, `printing`, `logging`, `updater`, `remarks_stamping`). |
 | `calibration_wizard.py` | Guided wizard for coordinate capture (Space/F8) and physical printer configuration. |
 | `engine.py` | Unified RPA loop for PDF generation, Live Print dispatch & focus restoration, and isolated `generate_otp()` sequence. |
 | `build.py` | PyInstaller build script compiling standalone `--onedir` distribution, release `.zip` + `.sha256`, and optional `--publish` release automation. |

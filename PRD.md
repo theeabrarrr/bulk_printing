@@ -49,15 +49,18 @@ flowchart TD
         EXE["ERP_Automation_Suite.exe"]
         CFG["config.json"]
         XLSX["complaints.xlsx"]
+        RXLSX["complaint_remarks.xlsx"]
         DB[("complaints_state.db (SQLite WAL)")]
         LOG["logs/app.log (Rotating 5MB x 5)"]
         OUT["Today_Complaints/"]
+        SOUT["Stamped_Complaints/"]
     end
 
     subgraph CoreEngine ["Modular Codebase Structure"]
         MAIN["main.py (Menu Router, Excel Validator & Batch Print)"]
         SETUP["calibration_wizard.py (Setup & Printer Config)"]
         ENGINE["engine.py (RPA Pipeline & Live Print)"]
+        REMARKS["pdf_remarks.py (PyMuPDF Remarks Stamping)"]
         PRINTMGR["printer_manager.py (GDI Render & Queue Gate)"]
         STATEMGR["state_manager.py (SQLite DAL & .txt Migrator)"]
         LOGMGR["logger_manager.py (Rotating File & Console Logger)"]
@@ -71,7 +74,13 @@ flowchart TD
     MAIN --> STATEMGR
     MAIN --> SETUP
     MAIN --> ENGINE
+    MAIN --> REMARKS
     MAIN --> PRINTMGR
+    REMARKS --> CFGMGR
+    REMARKS --> LOGMGR
+    REMARKS --> RXLSX
+    REMARKS --> OUT
+    REMARKS --> SOUT
     ENGINE --> PRINTMGR
     ENGINE --> STATEMGR
     ENGINE --> LOGMGR
@@ -96,15 +105,19 @@ flowchart TD
 - **`printer_manager.py`** *(UPDATED - COMPLETED)*:
   - Headless GDI PDF rendering via `pypdfium2` + `win32ui`, spooler queue monitoring, sliding-window reconciliation, and SQLite state persistence via `state_manager`.
 - **`config_manager.py`** *(UPDATED - COMPLETED)*:
-  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness, and schema defaults/validation for `coordinates`, `timings`, `settings` (`database_file`), `printing`, and `logging`.
+  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness, and schema defaults/validation for `coordinates`, `timings`, `settings` (`database_file`), `printing`, `logging`, `updater`, and `remarks_stamping`.
 - **`calibration_wizard.py`** *(UPDATED - COMPLETED)*:
   - Coordinate calibration for Print (5), OTP (4), or All (9) targets, and physical printer configuration with structured logging.
 - **`engine.py`** *(UPDATED - COMPLETED)*:
   - Unified RPA loop for complaint extraction and PDF creation with global ESC key latching, `Ctrl+C` handling, SQLite progress tracking, and Live Print dispatch.
+- **`pdf_remarks.py`** *(NEW - COMPLETED)*:
+  - Batch Technician Remarks PDF stamping engine via PyMuPDF: validates `complaint_remarks.xlsx` (keep-last duplicate handling, blank-remark skip), recursively matches PDFs, anchors vertically to the Technician Remarks table border, overlays wrapped/auto-scaled Regular Helvetica (`9.5`–`6.0 pt`, `...` truncation fallback), saves atomically into mirrored `Stamped_Complaints/` folders, and exports `logs/remarks_report_*.csv` on missing/truncated/error rows.
 - **`main.py`** *(UPDATED - COMPLETED)*:
-  - Primary menu (`[1]`–`[7]`), strict Excel validation & Pre-Flight Validation Summary (`validate_excel_dataframe`, `validate_and_load_excel_records`), and SQLite-backed Offline Batch Print (`[5]`).
+  - Primary menu (`[1]`–`[8]`, `[U]`), strict Excel validation & Pre-Flight Validation Summary (`validate_excel_dataframe`, `validate_and_load_excel_records`), Batch Remarks Stamping (`[7]`), and SQLite-backed Offline Batch Print (`[5]`) with `Today_Complaints` / `Stamped_Complaints` source switching (`[S]`).
+- **`updater.py`** *(UPDATED - COMPLETED)*:
+  - GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap while protecting runtime data including `Stamped_Complaints/` and `complaint_remarks.xlsx`.
 - **`build.py`** *(UPDATED - COMPLETED)*:
-  - Compiles `--onedir` distribution `dist/ERP_Automation_Suite/` preserving `complaints_state.db`, `logs/`, `Today_Complaints/`, `config.json`, and `complaints.xlsx`.
+  - Compiles `--onedir` distribution `dist/ERP_Automation_Suite/` (collecting `pypdfium2` and `pymupdf`) while preserving `complaints_state.db`, `logs/`, `Today_Complaints/`, `Stamped_Complaints/`, `config.json`, `complaints.xlsx`, and `complaint_remarks.xlsx`.
 
 ---
 
@@ -170,6 +183,28 @@ flowchart TD
     "check_on_startup": true,
     "startup_timeout_seconds": 3.0,
     "download_timeout_seconds": 60.0
+  },
+  "remarks_stamping": {
+    "excel_path": "complaint_remarks.xlsx",
+    "complaint_column": "COMPLAINT_NO",
+    "remarks_column": "REMARKS",
+    "input_dir": "Today_Complaints",
+    "output_dir": "Stamped_Complaints",
+    "rect": {
+      "x0": 360.48,
+      "y0": 516.70,
+      "x1": 603.15,
+      "y1": 645.76
+    },
+    "padding": 4.0,
+    "dynamic_anchor": true,
+    "anchor_reference_y": 517.08,
+    "footer_margin": 32.0,
+    "fontname": "helv",
+    "max_fontsize": 9.5,
+    "min_fontsize": 6.0,
+    "fontsize_step": 0.5,
+    "lineheight": 1.2
   }
 }
 ```
@@ -189,3 +224,4 @@ flowchart TD
 | **6.4** | **Strict Excel Input Validation** | **COMPLETED** | Implement header normalization, numeric ID validation, deduplication, and Pre-Flight Validation Summary in `main.py`. |
 | **6.5** | **Packaging & Documentation** | **COMPLETED** | Update `build.py` runtime preservation for SQLite/logs and synchronize `PRD.md` & `README.md`. |
 | **Phase 7** | **In-App Self-Updater (`updater.py`, `version.py`)** | **COMPLETED** | GitHub Releases API polling, SHA-256 verification, detached `.bat` swap with rollback protection, `[U]` CLI menu, and `build.py` release ZIP automation. |
+| **Phase 8** | **Batch Technician Remarks PDF Stamping (`pdf_remarks.py`)** | **COMPLETED** | PyMuPDF remarks stamping (`[7]`), dynamic border anchoring, font auto-scaling/truncation, mirrored `Stamped_Complaints/` output, `[5]` source switching, and CSV issue reporting. |
