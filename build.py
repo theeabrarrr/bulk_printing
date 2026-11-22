@@ -27,12 +27,14 @@ ENTRY_SCRIPT = os.path.join(PROJECT_DIR, "main.py")
 RUNTIME_PRESERVE_ITEMS = [
     "config.json",
     "complaints.xlsx",
+    "complaint_remarks.xlsx",
     "complaints_state.db",
     "complaints_state.db-wal",
     "complaints_state.db-shm",
     "completed_complaints.txt",
     "printed_complaints.txt",
     "Today_Complaints",
+    "Stamped_Complaints",
     "logs",
 ]
 
@@ -482,6 +484,7 @@ def build_executable(publish=False, release_notes=None):
             "--name",
             PACKAGE_NAME,
             "--collect-all", "pypdfium2",
+            "--collect-all", "pymupdf",
             "--hidden-import", "sqlite3",
             "--hidden-import", "win32print",
             "--hidden-import", "win32ui",

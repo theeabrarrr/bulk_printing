@@ -22,12 +22,14 @@ UPDATE_BAT_NAME = "_run_update.bat"
 PROTECTED_RUNTIME_ITEMS = {
     "config.json",
     "complaints.xlsx",
+    "complaint_remarks.xlsx",
     "complaints_state.db",
     "complaints_state.db-wal",
     "complaints_state.db-shm",
     "completed_complaints.txt",
     "printed_complaints.txt",
     "today_complaints",
+    "stamped_complaints",
     "logs",
 }
 

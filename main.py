@@ -17,6 +17,7 @@ import logger_manager
 import state_manager
 import calibration_wizard
 import engine
+import pdf_remarks
 import printer_manager
 import version
 import updater
@@ -619,6 +620,103 @@ def _discover_technician_folders(output_dir, printed_set):
     return folders
 
 
+def _strip_quotes(path_str):
+    """Strips surrounding single/double quotes (e.g., from Windows 'Copy as path')."""
+    s = str(path_str or "").strip()
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        return s[1:-1].strip()
+    return s
+
+
+def _directory_has_pdfs(directory):
+    """Returns True if `directory` exists and contains at least one PDF file."""
+    if not directory or not os.path.isdir(directory):
+        return False
+    for _, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in files:
+            if fname.lower().endswith(".pdf") and not fname.startswith("._"):
+                return True
+    return False
+
+
+def run_remarks_stamping_mode(config):
+    """
+    Interactive workflow for batch stamping Technician Remarks from complaint_remarks.xlsx
+    onto matching PDF job cards and saving outputs to Stamped_Complaints/.
+    """
+    engine.reset_abort()
+    remarks_cfg = config_manager.get_remarks_stamping_settings(config)
+    default_excel = config_manager.resolve_path(remarks_cfg.get("excel_path", "complaint_remarks.xlsx"))
+    default_input = config_manager.resolve_path(remarks_cfg.get("input_dir", "Today_Complaints"))
+    default_output = config_manager.resolve_path(remarks_cfg.get("output_dir", "Stamped_Complaints"))
+
+    print("\n" + "=" * 60)
+    print("       STAMP TECHNICIAN REMARKS ONTO PDFs (BATCH)")
+    print("=" * 60)
+    print("  Press [ENTER] at any prompt to accept the default path.")
+    print("  Press [ESC] during stamping or [Ctrl+C] to cancel.")
+    print("-" * 60)
+
+    try:
+        raw_excel = _strip_quotes(input(f"  Remarks Excel file [{default_excel}]: "))
+        excel_path = config_manager.resolve_path(raw_excel) if raw_excel else default_excel
+
+        if not os.path.isfile(excel_path):
+            logger.error(f"\n[!] Error: Remarks Excel file not found at:\n    {excel_path}")
+            return
+
+        if not check_excel_lock(excel_path):
+            logger.info("\n[!] Remarks stamping cancelled.")
+            return
+
+        raw_in = _strip_quotes(input(f"  Input PDF folder   [{default_input}]: "))
+        input_dir = config_manager.resolve_path(raw_in) if raw_in else default_input
+
+        if not os.path.isdir(input_dir):
+            logger.error(f"\n[!] Error: Input PDF folder does not exist:\n    {input_dir}")
+            return
+
+        raw_out = _strip_quotes(input(f"  Output PDF folder  [{default_output}]: "))
+        output_dir = config_manager.resolve_path(raw_out) if raw_out else default_output
+
+        try:
+            input_dir, output_dir = pdf_remarks.validate_io_directories(input_dir, output_dir)
+        except ValueError as path_err:
+            logger.error(f"\n[!] Invalid folder selection: {path_err}")
+            return
+
+        records, summary = pdf_remarks.validate_and_load_remarks_excel(
+            excel_path,
+            complaint_col=remarks_cfg["complaint_column"],
+            remarks_col=remarks_cfg["remarks_column"],
+        )
+        if records is None:
+            return
+        if not records:
+            logger.warning("\n[!] No valid complaint remark records found in the Excel file.")
+            return
+
+        confirm = input(
+            f"\nProceed with stamping {len(records)} record(s) into '{output_dir}'? (Y/n): "
+        ).strip().lower()
+        if confirm not in ["", "y", "yes"]:
+            logger.info("\n[i] Remarks stamping cancelled by operator.")
+            return
+
+        pdf_remarks.run_remarks_batch(
+            excel_path=excel_path,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            config=config,
+            check_abort_fn=engine.check_abort,
+            preloaded_records=records,
+            preloaded_summary=summary,
+        )
+    except KeyboardInterrupt:
+        logger.warning("\n[!] Remarks stamping interrupted by user (Ctrl+C). Returning to main menu.")
+
+
 def run_batch_print_mode(config):
     """
     Offline Batch Printing (Technician-Wise & Sliding-Window Spooling):
@@ -645,14 +743,46 @@ def run_batch_print_mode(config):
                 return
             is_fallback = False
 
-        output_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-        db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed", output_dir=output_dir)
+        today_dir = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
+        remarks_cfg = config_manager.get_remarks_stamping_settings(config)
+        stamped_dir = config_manager.resolve_path(remarks_cfg.get("output_dir", "Stamped_Complaints"))
+        db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed", output_dir=today_dir)
         max_queue = printing_settings.get("max_spool_queue", 3)
         spooler_query_timeout = printing_settings.get("spooler_query_timeout", 5.0)
 
-        if not os.path.exists(output_dir):
-            logger.warning(f"\n[!] Output directory '{output_dir}' does not exist. No PDFs to print.")
+        today_has_pdfs = _directory_has_pdfs(today_dir)
+        stamped_has_pdfs = _directory_has_pdfs(stamped_dir)
+
+        if not today_has_pdfs and not stamped_has_pdfs:
+            if not os.path.exists(today_dir):
+                logger.warning(f"\n[!] Output directory '{today_dir}' does not exist. No PDFs to print.")
+            else:
+                logger.warning(f"\n[!] No PDF documents found in '{today_dir}' or '{stamped_dir}'.")
             return
+
+        if not today_has_pdfs and stamped_has_pdfs:
+            output_dir = stamped_dir
+            source_label = "Stamped_Complaints (With Remarks)"
+            logger.info(f"\n[i] No PDFs in '{today_dir}'; using Stamped_Complaints: '{stamped_dir}'.")
+        elif today_has_pdfs and stamped_has_pdfs:
+            print("\n" + "-" * 65)
+            print("  SELECT PDF SOURCE FOLDER FOR BATCH PRINTING")
+            print("-" * 65)
+            print(f"  [1] Today_Complaints (Original)      : {today_dir}")
+            print(f"  [2] Stamped_Complaints (With Remarks): {stamped_dir}")
+            src_choice = input("Select PDF source [1/2, Default: 1] (or Q to cancel): ").strip().lower()
+            if src_choice in ["q", "quit", "exit"]:
+                print("Returning to main menu...")
+                return
+            if src_choice == "2":
+                output_dir = stamped_dir
+                source_label = "Stamped_Complaints (With Remarks)"
+            else:
+                output_dir = today_dir
+                source_label = "Today_Complaints (Original)"
+        else:
+            output_dir = today_dir
+            source_label = "Today_Complaints (Original)"
 
         while True:
             engine.reset_abort()
@@ -681,6 +811,7 @@ def run_batch_print_mode(config):
             print("        OFFLINE BATCH PRINTING - SELECT TECHNICIAN FOLDER")
             print("=" * 70)
             print(f" Target Printer   : {target_printer} [{p_cat}]{fallback_str}")
+            print(f" Source Folder    : {source_label}")
             print(f" Base Directory   : {output_dir}")
             print(f" State Database   : {os.path.basename(db_path)} (SQLite WAL)")
             print(f" Spooler Window   : Up to {max_queue} active jobs (Sliding-Window Pipeline)")
@@ -702,11 +833,11 @@ def run_batch_print_mode(config):
                 f"{printed_all:>9} {pending_all:>9}"
             )
             print("-" * 70)
-            print("  [R] Reset Global Print Tracker   [C] Change Printer   [Q] Main Menu")
+            print("  [R] Reset Print Tracker  [S] Switch Source  [C] Change Printer  [Q] Main Menu")
             print("=" * 70)
 
             sel_raw = input(
-                f"Select folder(s) (1-{len(folders)}, e.g. 1 or 1,2 | A=All | R=Reset | C=Printer | [Enter]/Q=Menu): "
+                f"Select folder(s) (1-{len(folders)}, e.g. 1 or 1,2 | A=All | S=Source | R=Reset | C=Printer | [Enter]/Q=Menu): "
             ).strip()
 
             if not sel_raw or sel_raw.lower() in ["q", "quit", "exit"]:
@@ -714,6 +845,27 @@ def run_batch_print_mode(config):
                 return
 
             low_sel = sel_raw.lower()
+            if low_sel == "s":
+                is_currently_today = (
+                    os.path.normcase(os.path.abspath(output_dir))
+                    == os.path.normcase(os.path.abspath(today_dir))
+                )
+                target_dir = stamped_dir if is_currently_today else today_dir
+                target_label = (
+                    "Stamped_Complaints (With Remarks)"
+                    if is_currently_today
+                    else "Today_Complaints (Original)"
+                )
+                if _directory_has_pdfs(target_dir):
+                    output_dir = target_dir
+                    source_label = target_label
+                    logger.info(f" [+] Switched print source to: {source_label} ({output_dir})")
+                else:
+                    logger.warning(
+                        f" [!] Cannot switch source: '{target_dir}' does not exist or contains no PDFs."
+                    )
+                continue
+
             if low_sel == "c":
                 new_printer, config = _select_validated_physical_printer(
                     config, initial_printer=target_printer, force_prompt=True
@@ -1125,13 +1277,14 @@ def main():
         print("  [2] Manual Mode (Process single/batch complaint #s)")
         print("  [3] Recalibrate Coordinates (Setup Wizard)")
         print("  [4] Generate OTP (Interactive Mode)")
-        print("  [5] Batch Print Offline PDFs (Today_Complaints)")
+        print("  [5] Batch Print Offline PDFs (Today_Complaints / Stamped)")
         print("  [6] Select / Change Target Printer")
+        print("  [7] Stamp Technician Remarks onto PDFs")
         print(f"  [U] Check for Updates (Current: v{version.__version__})")
-        print("  [7] Exit")
+        print("  [8] Exit")
         print("=" * 60)
 
-        choice = input("Select an option [1-7, U]: ").strip()
+        choice = input("Select an option [1-8, U]: ").strip()
 
         if choice == "1":
             run_bulk_mode(config)
@@ -1151,16 +1304,18 @@ def main():
                 printer_manager.select_printer_interactive(config=config, auto_save=True, force_prompt=True)
             except KeyboardInterrupt:
                 logger.warning("\n[!] Printer selection cancelled.")
+        elif choice == "7":
+            run_remarks_stamping_mode(config)
         elif choice.lower() in ["u", "update"]:
             try:
                 updater.run_interactive_update_check(config)
             except KeyboardInterrupt:
                 logger.warning("\n[!] Update check cancelled.")
-        elif choice == "7" or choice.lower() in ["exit", "q", "quit"]:
+        elif choice == "8" or choice.lower() in ["exit", "q", "quit"]:
             logger.info("\nExiting ERP Automation Suite. Goodbye!")
             break
         else:
-            logger.warning("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, or U.")
+            logger.warning("\n[!] Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, 8, or U.")
 
 
 if __name__ == "__main__":
