@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (Phase 6: Enterprise Architecture, SQLite State & Observability)
-**Document Version:** 2.0.0  
-**Status:** Completed (Phase 6: SQLite WAL State Management, Rotating Logging & Strict Excel Validation)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (v6.2.0: Enterprise Architecture, Self-Updater & Batch Remarks PDF Stamping)
+**Document Version:** 2.1.0  
+**Status:** Completed (v6.2.0 — Phase 6–8: SQLite WAL State, In-App Self-Updater & Batch Technician Remarks PDF Stamping)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
