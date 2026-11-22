@@ -61,5 +61,27 @@
     "check_on_startup": true,
     "startup_timeout_seconds": 3.0,
     "download_timeout_seconds": 60.0
+  },
+  "remarks_stamping": {
+    "excel_path": "complaint_remarks.xlsx",
+    "complaint_column": "COMPLAINT_NO",
+    "remarks_column": "REMARKS",
+    "input_dir": "Today_Complaints",
+    "output_dir": "Stamped_Complaints",
+    "rect": {
+      "x0": 360.48,
+      "y0": 516.70,
+      "x1": 603.15,
+      "y1": 645.76
+    },
+    "padding": 4.0,
+    "dynamic_anchor": true,
+    "anchor_reference_y": 517.08,
+    "footer_margin": 32.0,
+    "fontname": "helv",
+    "max_fontsize": 9.5,
+    "min_fontsize": 6.0,
+    "fontsize_step": 0.5,
+    "lineheight": 1.2
   }
 }

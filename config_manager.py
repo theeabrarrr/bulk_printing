@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import copy
+import math
 import ctypes
 import pyautogui
 
@@ -67,6 +69,28 @@ DEFAULT_CONFIG = {
         "check_on_startup": True,
         "startup_timeout_seconds": 3.0,
         "download_timeout_seconds": 60.0
+    },
+    "remarks_stamping": {
+        "excel_path": "complaint_remarks.xlsx",
+        "complaint_column": "COMPLAINT_NO",
+        "remarks_column": "REMARKS",
+        "input_dir": "Today_Complaints",
+        "output_dir": "Stamped_Complaints",
+        "rect": {
+            "x0": 360.48,
+            "y0": 516.70,
+            "x1": 603.15,
+            "y1": 645.76
+        },
+        "padding": 4.0,
+        "dynamic_anchor": True,
+        "anchor_reference_y": 517.08,
+        "footer_margin": 32.0,
+        "fontname": "helv",
+        "max_fontsize": 9.5,
+        "min_fontsize": 6.0,
+        "fontsize_step": 0.5,
+        "lineheight": 1.2
     }
 }
 
@@ -179,15 +203,15 @@ def load_config(config_path=None):
     # Deep merge missing sections or keys with defaults
     for section, defaults in DEFAULT_CONFIG.items():
         if section not in cfg or not isinstance(cfg[section], dict):
-            cfg[section] = defaults.copy()
+            cfg[section] = copy.deepcopy(defaults)
         else:
             for k, v in defaults.items():
                 if k not in cfg[section]:
-                    cfg[section][k] = v
+                    cfg[section][k] = copy.deepcopy(v)
                 elif isinstance(v, dict) and isinstance(cfg[section][k], dict):
                     for sub_k, sub_v in v.items():
                         if sub_k not in cfg[section][k] or cfg[section][k][sub_k] is None:
-                            cfg[section][k][sub_k] = sub_v
+                            cfg[section][k][sub_k] = copy.deepcopy(sub_v)
 
     # Deep schema validation: Ensure all UI coordinate targets exist with integer x and y
     validate_coordinates(cfg)
@@ -356,6 +380,106 @@ def get_updater_settings(config=None):
         merged["download_timeout_seconds"] = max(5.0, float(merged.get("download_timeout_seconds", 60.0)))
     except (ValueError, TypeError):
         merged["download_timeout_seconds"] = 60.0
+
+    return merged
+
+
+def _parse_finite_float(val, default):
+    """Converts val to a finite float, returning default if invalid or boolean."""
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        parsed = float(val)
+    except (ValueError, TypeError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def _parse_nonempty_str(val, default):
+    """Returns stripped non-empty string or default."""
+    if val is None or isinstance(val, (dict, list, bool)):
+        return default
+    s = str(val).strip()
+    return s if s else default
+
+
+def get_remarks_stamping_settings(config=None):
+    """
+    Returns the remarks_stamping configuration dictionary with default fallbacks and type safety.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    remarks_cfg = config.get("remarks_stamping", {}) if isinstance(config, dict) else {}
+    if not isinstance(remarks_cfg, dict):
+        remarks_cfg = {}
+    default_remarks = DEFAULT_CONFIG["remarks_stamping"]
+
+    merged = {}
+    for k, v in default_remarks.items():
+        if k == "rect":
+            continue
+        merged[k] = remarks_cfg.get(k, v)
+
+    for str_key in (
+        "excel_path",
+        "complaint_column",
+        "remarks_column",
+        "input_dir",
+        "output_dir",
+        "fontname",
+    ):
+        merged[str_key] = _parse_nonempty_str(merged.get(str_key), default_remarks[str_key])
+
+    default_rect = default_remarks["rect"]
+    raw_rect = remarks_cfg.get("rect")
+    if isinstance(raw_rect, dict):
+        parsed_rect = {
+            axis: _parse_finite_float(raw_rect.get(axis, default_rect[axis]), None)
+            for axis in ("x0", "y0", "x1", "y1")
+        }
+        if (
+            all(v is not None for v in parsed_rect.values())
+            and parsed_rect["x1"] > parsed_rect["x0"]
+            and parsed_rect["y1"] > parsed_rect["y0"]
+        ):
+            merged["rect"] = parsed_rect
+        else:
+            merged["rect"] = dict(default_rect)
+    else:
+        merged["rect"] = dict(default_rect)
+
+    merged["padding"] = max(0.0, _parse_finite_float(merged.get("padding"), default_remarks["padding"]))
+    merged["footer_margin"] = max(
+        0.0, _parse_finite_float(merged.get("footer_margin"), default_remarks["footer_margin"])
+    )
+
+    anchor_y = _parse_finite_float(merged.get("anchor_reference_y"), default_remarks["anchor_reference_y"])
+    merged["anchor_reference_y"] = anchor_y if anchor_y > 0.0 else default_remarks["anchor_reference_y"]
+
+    raw_dyn = merged.get("dynamic_anchor", default_remarks["dynamic_anchor"])
+    if raw_dyn is None:
+        merged["dynamic_anchor"] = default_remarks["dynamic_anchor"]
+    elif isinstance(raw_dyn, str):
+        merged["dynamic_anchor"] = raw_dyn.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        merged["dynamic_anchor"] = bool(raw_dyn)
+
+    min_fs = _parse_finite_float(merged.get("min_fontsize"), default_remarks["min_fontsize"])
+    merged["min_fontsize"] = max(2.0, min_fs)
+
+    max_fs = _parse_finite_float(merged.get("max_fontsize"), default_remarks["max_fontsize"])
+    if max_fs <= 0.0:
+        max_fs = default_remarks["max_fontsize"]
+    merged["max_fontsize"] = max(merged["min_fontsize"], max_fs)
+
+    step = _parse_finite_float(merged.get("fontsize_step"), default_remarks["fontsize_step"])
+    merged["fontsize_step"] = step if step > 0.0 else default_remarks["fontsize_step"]
+
+    lh = _parse_finite_float(merged.get("lineheight"), default_remarks["lineheight"])
+    merged["lineheight"] = max(0.8, lh)
 
     return merged
 
