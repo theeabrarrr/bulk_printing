@@ -886,6 +886,7 @@ def mark_complaint_print_failed(
     printer_name: str = "",
     job_id: Optional[int] = None,
     reason: str = "",
+    technician: Optional[str] = None,
 ) -> bool:
     """
     Records a complaint print job as PRINT_FAILED in SQLite so its PDF download state is
@@ -900,6 +901,7 @@ def mark_complaint_print_failed(
         file_path=file_path,
         printer_name=printer_name,
         job_id=job_id,
+        technician=technician,
     )
 
 
@@ -945,11 +947,19 @@ def reset_printed_tracker_safe(target: Optional[Union[str, Dict]] = None) -> Opt
         with conn:
             conn.execute(
                 """
+                DELETE FROM complaints
+                WHERE status IN ('SPOOLED', 'PRINTED', 'PRINT_FAILED')
+                  AND TRIM(COALESCE(file_path, '')) = ''
+                """
+            )
+            conn.execute(
+                """
                 UPDATE complaints
                 SET status = 'DOWNLOADED',
                     job_id = NULL,
                     updated_at = ?
                 WHERE status IN ('SPOOLED', 'PRINTED', 'PRINT_FAILED')
+                  AND TRIM(COALESCE(file_path, '')) != ''
                 """,
                 (now,),
             )

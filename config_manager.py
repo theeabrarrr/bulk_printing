@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
         "checkbox_wait_seconds": 1.0,
         "browser_pdf_load_seconds": 8.0,
         "foxit_print_dialog_seconds": 2.5,
+        "direct_print_spool_seconds": 3.0,
         "save_dialog_seconds": 3.0,
         "file_save_processing_seconds": 4.0,
         "window_switch_seconds": 2.0,

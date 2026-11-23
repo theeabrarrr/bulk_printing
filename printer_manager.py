@@ -6,6 +6,7 @@ for lightweight (<1 MB/page), zero-popup physical printing that prevents PCL XL 
 Persists spooler & print job state via state_manager (SQLite complaints_state.db).
 """
 
+from contextlib import contextmanager
 import ctypes
 import gc
 import os
@@ -333,6 +334,59 @@ def get_default_printer() -> Optional[str]:
         return win32print.GetDefaultPrinter()
     except Exception:
         return None
+
+
+def set_default_printer(printer_name: str) -> bool:
+    """
+    Sets the Windows OS default printer to `printer_name`.
+    Returns True if succeeded, False otherwise.
+    """
+    if not win32print or not printer_name:
+        return False
+    try:
+        win32print.SetDefaultPrinter(printer_name)
+        logger.debug("Set Windows OS default printer to '%s'.", printer_name)
+        return True
+    except Exception as e:
+        logger.warning(f" [!] Warning: Failed to set Windows default printer to '{printer_name}': {e}")
+        return False
+
+
+@contextmanager
+def temporary_default_printer(target_printer: Optional[str]):
+    """
+    Context manager that temporarily switches the Windows OS default printer to
+    `target_printer` and reliably restores the previous OS default printer on exit.
+    """
+    original_default = get_default_printer()
+    switched = False
+    target = str(target_printer).strip() if target_printer else ""
+
+    if target and target != (original_default or ""):
+        installed = get_installed_printers()
+        if not installed or target in installed:
+            if set_default_printer(target):
+                switched = True
+                logger.info(
+                    f"[*] Temporarily set Windows default printer to '{target}' "
+                    f"(previous: '{original_default or 'None'}')."
+                )
+        else:
+            logger.warning(
+                f"[!] Target printer '{target}' not found in installed printers; "
+                f"keeping OS default '{original_default or 'None'}'."
+            )
+
+    try:
+        yield switched
+    finally:
+        if switched and original_default:
+            if set_default_printer(original_default):
+                logger.info(f"[*] Restored Windows default printer to '{original_default}'.")
+            else:
+                logger.warning(
+                    f"[!] Warning: Could not restore previous Windows default printer '{original_default}'."
+                )
 
 
 def _get_printer_error_flags() -> Dict[int, str]:
@@ -1256,6 +1310,94 @@ def reconcile_print_job(
         time.sleep(poll_interval)
 
 
+def wait_for_direct_print_spool(
+    printer_name: str,
+    prior_job_ids: Optional[Set[int]] = None,
+    timeout: float = 3.0,
+    min_wait: float = 2.0,
+    poll_interval: float = 0.4,
+    check_abort_fn: Optional[Callable[[], bool]] = None,
+    spooler_query_timeout: Optional[float] = None,
+    query_timeout: Optional[float] = None,
+    config: Optional[Dict] = None,
+) -> Tuple[bool, Optional[int], str]:
+    """
+    Waits safely for a browser-initiated Ctrl+P print job to enter the Windows Spooler
+    on `printer_name` (and checks for immediate job or printer hardware errors).
+    Polls for at least `min_wait` seconds (capped by `timeout`) so the browser/Foxit
+    finishes submitting the job before focus returns to the ERP window, and continues
+    up to `timeout` seconds until a new job ID appears or spool wait completes cleanly.
+
+    Returns:
+        (ok: bool, detected_job_id: Optional[int], message: str)
+    """
+    if not win32print and get_queue_status is _ORIG_GET_QUEUE_STATUS:
+        return False, None, "Windows spooler API unavailable"
+
+    prior: Set[int] = set(prior_job_ids or ())
+    effective_timeout = max(0.0, float(timeout))
+    effective_min_wait = min(effective_timeout, max(0.0, float(min_wait)))
+    effective_poll = max(0.05, float(poll_interval))
+    effective_query_timeout = _resolve_spooler_query_timeout(
+        spooler_query_timeout, query_timeout=query_timeout, config=config
+    )
+
+    start_ts = time.time()
+    deadline = start_ts + effective_timeout
+    min_deadline = start_ts + effective_min_wait
+    detected_job_id: Optional[int] = None
+
+    while True:
+        if check_abort_fn and check_abort_fn():
+            return False, detected_job_id, "Process aborted by user (Esc pressed)."
+
+        status = _call_get_queue_status(printer_name, timeout=effective_query_timeout)
+        has_error = bool(status.get("has_error", False))
+        query_error = bool(status.get("query_error", False))
+        error_reasons = status.get("error_reasons") or []
+        jobs = status.get("jobs") or []
+
+        if detected_job_id is None:
+            for job in jobs:
+                jid = job.get("job_id")
+                if isinstance(jid, int) and not isinstance(jid, bool) and jid > 0 and jid not in prior:
+                    detected_job_id = jid
+                    break
+
+        if detected_job_id is not None:
+            state, reason = inspect_job_in_status(status, job_id=detected_job_id)
+            if state == "FAILED":
+                return False, detected_job_id, reason
+            if time.time() >= min_deadline:
+                if state == "CONFIRMED":
+                    return True, detected_job_id, reason
+                return True, detected_job_id, f"Print job #{detected_job_id} spooled cleanly to '{printer_name}'."
+        else:
+            if has_error and not query_error:
+                reason_text = ", ".join(str(r) for r in error_reasons) or "Printer error detected"
+                return False, None, f"Printer error while spooling: {reason_text}"
+            if time.time() >= deadline:
+                return True, None, f"Spool wait completed on '{printer_name}' with no spooler errors (fast-drained)."
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            if detected_job_id is not None:
+                return True, detected_job_id, f"Print job #{detected_job_id} spooled cleanly to '{printer_name}'."
+            return True, None, f"Spool wait completed on '{printer_name}' with no spooler errors."
+
+        sleep_for = min(effective_poll, remaining)
+        if check_abort_fn and sleep_for > 0.1:
+            slept = 0.0
+            while slept < sleep_for:
+                if check_abort_fn():
+                    return False, detected_job_id, "Process aborted by user (Esc pressed)."
+                step = min(0.1, sleep_for - slept)
+                time.sleep(step)
+                slept += step
+        elif sleep_for > 0:
+            time.sleep(sleep_for)
+
+
 def _find_matching_job_in_status(
     status: Dict,
     job_id: Optional[int] = None,
@@ -1334,9 +1476,10 @@ def reconcile_in_flight_jobs(
 
     for item in in_flight:
         c_num = item["complaint_no"]
-        p_path = item["file_path"]
+        p_path = item.get("file_path", "")
         j_id = item.get("job_id")
         d_name = item.get("doc_name")
+        tech_name = item.get("technician")
 
         matched_job = _find_matching_job_in_status(status, job_id=j_id, doc_name=d_name)
         if matched_job is None and (has_error or query_error) and not is_mocked_silent_print:
@@ -1346,17 +1489,34 @@ def reconcile_in_flight_jobs(
 
         state, reason = inspect_job_in_status(status, job_id=j_id, doc_name=d_name)
         if state == "CONFIRMED":
-            if not mark_complaint_printed(
-                resolved_tracker, c_num, p_path, printer_name, job_id=j_id
-            ):
+            try:
+                recorded_ok = mark_complaint_printed(
+                    resolved_tracker, c_num, p_path, printer_name, job_id=j_id, technician=tech_name
+                )
+            except TypeError:
+                recorded_ok = mark_complaint_printed(
+                    resolved_tracker, c_num, p_path, printer_name, job_id=j_id
+                )
+            if not recorded_ok:
                 raise RuntimeError(f"Failed to record confirmed print for #{c_num} in state database.")
             confirmed_now += 1
             logger.info(f"  [✓] Complaint #{c_num} confirmed printed on {printer_name}.")
         elif state == "FAILED":
             try:
-                state_manager.mark_complaint_print_failed(
-                    resolved_tracker, c_num, file_path=p_path, printer_name=printer_name, job_id=j_id, reason=reason
-                )
+                try:
+                    state_manager.mark_complaint_print_failed(
+                        resolved_tracker,
+                        c_num,
+                        file_path=p_path,
+                        printer_name=printer_name,
+                        job_id=j_id,
+                        reason=reason,
+                        technician=tech_name,
+                    )
+                except TypeError:
+                    state_manager.mark_complaint_print_failed(
+                        resolved_tracker, c_num, file_path=p_path, printer_name=printer_name, job_id=j_id, reason=reason
+                    )
             except Exception as err:
                 logger.debug("Could not mark PRINT_FAILED for #%s: %s", c_num, err)
             failed_now.append((c_num, reason))
@@ -1457,14 +1617,25 @@ def drain_in_flight_jobs(
                 for item in list(in_flight):
                     c_num = item["complaint_no"]
                     try:
-                        state_manager.mark_complaint_print_failed(
-                            resolved_tracker,
-                            c_num,
-                            file_path=item.get("file_path", ""),
-                            printer_name=printer_name,
-                            job_id=item.get("job_id"),
-                            reason="Skipped during final spooler drain by operator",
-                        )
+                        try:
+                            state_manager.mark_complaint_print_failed(
+                                resolved_tracker,
+                                c_num,
+                                file_path=item.get("file_path", ""),
+                                printer_name=printer_name,
+                                job_id=item.get("job_id"),
+                                reason="Skipped during final spooler drain by operator",
+                                technician=item.get("technician"),
+                            )
+                        except TypeError:
+                            state_manager.mark_complaint_print_failed(
+                                resolved_tracker,
+                                c_num,
+                                file_path=item.get("file_path", ""),
+                                printer_name=printer_name,
+                                job_id=item.get("job_id"),
+                                reason="Skipped during final spooler drain by operator",
+                            )
                     except Exception:
                         pass
                     total_failed.append((c_num, "Skipped during final spooler drain by operator"))
@@ -1499,7 +1670,8 @@ def mark_complaint_spooled(
     complaint_no: str,
     file_path: str = "",
     printer_name: str = "",
-    job_id: Optional[int] = None
+    job_id: Optional[int] = None,
+    technician: Optional[str] = None,
 ) -> bool:
     """
     Records a complaint print job as SPOOLED (not yet confirmed printed) in the SQLite state database.
@@ -1511,7 +1683,8 @@ def mark_complaint_spooled(
         complaint_no,
         file_path=file_path,
         printer_name=printer_name,
-        job_id=job_id
+        job_id=job_id,
+        technician=technician,
     )
 
 
@@ -1521,7 +1694,8 @@ def mark_complaint_printed(
     file_path: str = "",
     printer_name: str = "",
     status: str = "PRINTED",
-    job_id: Optional[int] = None
+    job_id: Optional[int] = None,
+    technician: Optional[str] = None,
 ) -> bool:
     """
     Atomically records a complaint as confirmed PRINTED in the SQLite state database.
@@ -1534,7 +1708,8 @@ def mark_complaint_printed(
         file_path=file_path,
         printer_name=printer_name,
         status=status,
-        job_id=job_id
+        job_id=job_id,
+        technician=technician,
     )
 
 

@@ -297,6 +297,64 @@ def validate_and_load_excel_records(excel_path, complaint_col="COMPLAINT_NO", te
     return records, summary
 
 
+def _prompt_print_workflow_mode(config):
+    """
+    Prompts the operator to choose between:
+      [1] Save PDF to Disk (Existing Workflow)
+      [2] Direct Browser Print (No PDF Save - Straight to Physical Printer)
+    When [2] is selected, confirms/validates a PHYSICAL target printer (with [C] to change).
+    Returns (direct_print: Optional[bool], target_printer: Optional[str], config: dict).
+    Returns (None, None, config) if cancelled by operator.
+    """
+    print("\n" + "-" * 55)
+    print("  SELECT PRINT WORKFLOW MODE")
+    print("-" * 55)
+    print("  [1] Save PDF to Disk (Existing Workflow - Today_Complaints/)")
+    print("  [2] Direct Browser Print (No PDF Save - Straight to Printer)")
+    print("-" * 55)
+
+    while True:
+        wf_choice = input("Select workflow mode [1/2, Default: 1] (or Q to cancel): ").strip().lower()
+        if wf_choice in ["q", "quit", "exit"]:
+            return None, None, config
+        if wf_choice in ["", "1"]:
+            return False, None, config
+        if wf_choice == "2":
+            break
+        print("    Please enter '1', '2', or 'Q' to cancel.")
+
+    configured_printer, is_fallback = config_manager.get_configured_printer(config)
+    if not configured_printer or printer_manager.classify_printer(configured_printer) == "VIRTUAL":
+        logger.info("\n[!] Direct Browser Print requires a physical printer. Please select one:")
+        configured_printer, config = _select_validated_physical_printer(
+            config, initial_printer=configured_printer, force_prompt=True
+        )
+        if not configured_printer:
+            return None, None, config
+        is_fallback = False
+
+    while True:
+        fb_note = " (Auto-Detected)" if is_fallback else ""
+        p_cat = printer_manager.classify_printer(configured_printer)
+        confirm_p = input(
+            f"\n[->] Direct Print Target Printer: '{configured_printer}' [{p_cat}]{fb_note}\n"
+            "     Press [ENTER] to confirm, [C] to change printer, or [Q] to cancel: "
+        ).strip().lower()
+        if confirm_p in ["", "y", "yes"]:
+            return True, configured_printer, config
+        elif confirm_p == "c":
+            new_printer, config = _select_validated_physical_printer(
+                config, initial_printer=configured_printer, force_prompt=True
+            )
+            if new_printer:
+                configured_printer = new_printer
+                is_fallback = False
+        elif confirm_p in ["q", "quit", "exit", "n", "no"]:
+            return None, None, config
+        else:
+            print("    Please press [ENTER] to confirm, 'C' to change printer, or 'Q' to cancel.")
+
+
 def run_bulk_mode(config):
     """Loads complaints.xlsx, performs pre-flight checks and strict validation, and dispatches batch to engine."""
     engine.reset_abort()
@@ -324,6 +382,24 @@ def run_bulk_mode(config):
 
         if not records:
             logger.warning("\n[!] No valid complaint records found in the Excel file.")
+            return
+
+        direct_print, target_printer, config = _prompt_print_workflow_mode(config)
+        if direct_print is None:
+            logger.info("\n[!] Bulk mode cancelled.")
+            return
+
+        if direct_print:
+            logger.info(f"    [+] Direct Browser Print enabled -> '{target_printer}' (No PDF Save).")
+            engine.run_batch(
+                records,
+                config=config,
+                start_delay=5,
+                organize_by_tech=True,
+                live_print=False,
+                direct_print=True,
+                target_printer=target_printer,
+            )
             return
 
         # Prompt user for folder routing preference
@@ -373,6 +449,7 @@ def run_bulk_mode(config):
 def run_manual_mode(config):
     """
     Prompts for one or multiple complaint numbers (comma or space-separated),
+    workflow mode (Save PDF to Disk vs. Direct Browser Print),
     a batch/technician folder name, and processes each sequentially.
     """
     engine.reset_abort()
@@ -405,77 +482,99 @@ def run_manual_mode(config):
         if has_duplicates:
             logger.info(f"  [!] Notice: Duplicate numbers detected and removed. ({len(complaints)} unique record(s))")
 
+        direct_print, target_printer, config = _prompt_print_workflow_mode(config)
+        if direct_print is None:
+            logger.info("  [!] Manual mode cancelled.")
+            return
+
         tech_name = input("  Enter Batch / Technician Name [default: Manual_Batch]: ").strip()
         if not tech_name:
             tech_name = "Manual_Batch"
 
-        # Prompt user for Live Printing preference
-        configured_printer, is_fallback = config_manager.get_configured_printer(config)
-        fallback_hint = " (Auto-Detected)" if is_fallback else ""
-        p_cat = f" [{printer_manager.classify_printer(configured_printer)}]" if configured_printer else ""
-        printer_label = f"{configured_printer}{p_cat}{fallback_hint}" if configured_printer else "None (PDF only)"
+        live_print = False
+        if direct_print:
+            logger.info(f"\n[*] Manual Direct-Print Batch Queued: {len(complaints)} complaint(s) -> '{target_printer}' (Batch: '{tech_name}').")
+        else:
+            # Prompt user for Live Printing preference
+            configured_printer, is_fallback = config_manager.get_configured_printer(config)
+            fallback_hint = " (Auto-Detected)" if is_fallback else ""
+            p_cat = f" [{printer_manager.classify_printer(configured_printer)}]" if configured_printer else ""
+            printer_label = f"{configured_printer}{p_cat}{fallback_hint}" if configured_printer else "None (PDF only)"
 
-        live_choice = input(f"  Enable Live Physical Printing to '{printer_label}'? (y/N) [or C to change]: ").strip().lower()
-        if live_choice == "c":
-            configured_printer, config = _select_validated_physical_printer(config, initial_printer=configured_printer, force_prompt=True)
-            if configured_printer:
-                live_choice = input(f"  Enable Live Physical Printing to '{configured_printer}'? (y/N) [Default: N]: ").strip().lower()
-            else:
-                live_choice = "n"
+            live_choice = input(f"  Enable Live Physical Printing to '{printer_label}'? (y/N) [or C to change]: ").strip().lower()
+            if live_choice == "c":
+                configured_printer, config = _select_validated_physical_printer(config, initial_printer=configured_printer, force_prompt=True)
+                if configured_printer:
+                    live_choice = input(f"  Enable Live Physical Printing to '{configured_printer}'? (y/N) [Default: N]: ").strip().lower()
+                else:
+                    live_choice = "n"
 
-        if live_choice in ["y", "yes"] and (not configured_printer or printer_manager.classify_printer(configured_printer) == "VIRTUAL"):
-            configured_printer, config = _select_validated_physical_printer(config, initial_printer=configured_printer, force_prompt=True)
+            if live_choice in ["y", "yes"] and (not configured_printer or printer_manager.classify_printer(configured_printer) == "VIRTUAL"):
+                configured_printer, config = _select_validated_physical_printer(config, initial_printer=configured_printer, force_prompt=True)
 
-        live_print = (live_choice in ["y", "yes"]) and bool(configured_printer)
-        if live_print:
-            logger.info(f"  [+] Live physical printing enabled for '{configured_printer}'.")
+            live_print = (live_choice in ["y", "yes"]) and bool(configured_printer)
+            if live_print:
+                logger.info(f"  [+] Live physical printing enabled for '{configured_printer}'.")
 
-        logger.info(f"\n[*] Manual Batch Queued: {len(complaints)} complaint(s) for folder '{tech_name}'.")
-        logger.info("[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
-        for i in range(5, 0, -1):
-            if engine.check_abort():
-                logger.warning("\n[!] Aborted during countdown.")
-                return
-            print(f"  Countdown: {i}...")
-            time.sleep(1.0)
+            logger.info(f"\n[*] Manual Batch Queued: {len(complaints)} complaint(s) for folder '{tech_name}'.")
+
+        default_printer_target = target_printer if direct_print else (
+            "Microsoft Print to PDF" if "Microsoft Print to PDF" in printer_manager.get_installed_printers() else None
+        )
+
+        stats = {
+            "total": len(complaints),
+            "completed": 0,
+            "failed": 0,
+            "aborted": False
+        }
+
+        with printer_manager.temporary_default_printer(default_printer_target):
+            logger.info("[*] Starting in 5 seconds! Please ensure your ERP window is open and maximized...")
+            for i in range(5, 0, -1):
+                if engine.check_abort():
+                    logger.warning("\n[!] Aborted during countdown.")
+                    return
+                print(f"  Countdown: {i}...")
+                time.sleep(1.0)
+
+            try:
+                for idx, complaint_no in enumerate(complaints, 1):
+                    if engine.check_abort():
+                        logger.warning("\n[!] Manual batch processing stopped by user (Esc pressed).")
+                        stats["aborted"] = True
+                        break
+
+                    logger.info(f"\n[->] [{idx}/{len(complaints)}] Processing Complaint #: {complaint_no} (Batch: {tech_name})")
+                    # record_progress=False avoids state contamination with bulk execution
+                    success, msg = engine.process_complaint(
+                        complaint_no,
+                        tech_name,
+                        config=config,
+                        record_progress=False,
+                        organize_by_tech=True,
+                        live_print=live_print,
+                        direct_print=direct_print,
+                        target_printer=target_printer,
+                    )
+
+                    if success:
+                        stats["completed"] += 1
+                        logger.info(f"  [+] Complaint #{complaint_no} processed successfully!")
+                    else:
+                        if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                            logger.warning(f"  [!] Execution aborted: {msg}")
+                            stats["aborted"] = True
+                            break
+                        else:
+                            logger.error(f"  [!] Complaint #{complaint_no} failed or stopped: {msg}")
+                            stats["failed"] += 1
+            except KeyboardInterrupt:
+                logger.warning("\n[!] Manual batch interrupted by user (Ctrl+C).")
+                stats["aborted"] = True
     except KeyboardInterrupt:
         logger.warning("\n[!] Manual mode cancelled by user (Ctrl+C).")
         return
-
-    stats = {
-        "total": len(complaints),
-        "completed": 0,
-        "failed": 0,
-        "aborted": False
-    }
-
-    try:
-        for idx, complaint_no in enumerate(complaints, 1):
-            if engine.check_abort():
-                logger.warning("\n[!] Manual batch processing stopped by user (Esc pressed).")
-                stats["aborted"] = True
-                break
-
-            logger.info(f"\n[->] [{idx}/{len(complaints)}] Processing Complaint #: {complaint_no} (Batch: {tech_name})")
-            # record_progress=False avoids state contamination with bulk execution
-            success, msg = engine.process_complaint(
-                complaint_no, tech_name, config=config, record_progress=False, organize_by_tech=True, live_print=live_print
-            )
-
-            if success:
-                stats["completed"] += 1
-                logger.info(f"  [+] Complaint #{complaint_no} processed successfully!")
-            else:
-                if "aborted" in msg.lower() or "failsafe" in msg.lower():
-                    logger.warning(f"  [!] Execution aborted: {msg}")
-                    stats["aborted"] = True
-                    break
-                else:
-                    logger.error(f"  [!] Complaint #{complaint_no} failed or stopped: {msg}")
-                    stats["failed"] += 1
-    except KeyboardInterrupt:
-        logger.warning("\n[!] Manual batch interrupted by user (Ctrl+C).")
-        stats["aborted"] = True
 
     print("\n" + "=" * 50)
     print("        MANUAL BATCH EXECUTION SUMMARY")

@@ -106,7 +106,7 @@ def record_completed_complaint(progress_file_path, complaint_no, technician="Unk
         logger.warning("[Warning] Failed to write complaint #%s to state database '%s': %s", complaint_no, progress_file_path, e)
 
 
-def _dispatch_live_print(num, file_path, config, timings):
+def _dispatch_live_print(num, file_path, config, timings, target_printer=None):
     """
     Executes queue-gated silent physical printing and job reconciliation for a saved PDF.
     Ensures the ERP window is restored to the foreground after any interactive queue gate prompt.
@@ -115,7 +115,10 @@ def _dispatch_live_print(num, file_path, config, timings):
     import printer_manager as pm
 
     printing_cfg = config_manager.get_printing_settings(config)
-    target_printer, is_fallback = config_manager.get_configured_printer(config)
+    if target_printer:
+        is_fallback = False
+    else:
+        target_printer, is_fallback = config_manager.get_configured_printer(config)
     db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="printed")
     max_queue = printing_cfg.get("max_spool_queue", 3)
     spooler_query_timeout = printing_cfg.get("spooler_query_timeout", 5.0)
@@ -207,9 +210,21 @@ def _dispatch_live_print(num, file_path, config, timings):
             restore_erp_focus(timings)
 
 
-def process_complaint(complaint_no, tech_name, config=None, record_progress=True, organize_by_tech=True, live_print=False):
+def process_complaint(
+    complaint_no,
+    tech_name,
+    config=None,
+    record_progress=True,
+    organize_by_tech=True,
+    live_print=False,
+    direct_print=False,
+    target_printer=None,
+    in_flight=None,
+):
     """
     Executes the battle-tested RPA printing sequence for a single complaint.
+    When `direct_print=True`, skips saving PDF to disk and sends Ctrl+P directly to
+    `target_printer` (with spooler queue gating and win32print spool verification).
     Returns (success: bool, message: str).
     """
     if config is None:
@@ -224,25 +239,93 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
     num = str(complaint_no).strip()
     tech = sanitize_technician_name(tech_name)
 
-    # Prepare destination folder with explicit error handling
     output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
     dest_folder = os.path.join(output_base, tech) if organize_by_tech else os.path.join(output_base, "All_PDFs")
-    try:
-        os.makedirs(dest_folder, exist_ok=True)
-    except OSError as e:
-        logger.error(f"\n[!] Failed to create destination folder '{dest_folder}': {e}", exc_info=True)
-        return False, f"Destination folder creation failed: {e}"
+    if not direct_print:
+        # Prepare destination folder with explicit error handling
+        try:
+            os.makedirs(dest_folder, exist_ok=True)
+        except OSError as e:
+            logger.error(f"\n[!] Failed to create destination folder '{dest_folder}': {e}", exc_info=True)
+            return False, f"Destination folder creation failed: {e}"
 
-    db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="completed", output_dir=output_base)
+    db_path = state_manager.ensure_tracker_db_ready(
+        config, tracker_kind="printed" if direct_print else "completed", output_dir=output_base
+    )
 
     # Early abort check
     if check_abort():
         logger.info("Process aborted by user (Esc pressed) before starting complaint #%s.", num)
         return False, "Process aborted by user (Esc pressed)."
 
+    resolved_printer = None
+    max_queue = 3
+    spooler_query_timeout = 5.0
+    pm = None
+
+    if direct_print:
+        import printer_manager as pm
+
+        printing_cfg = config_manager.get_printing_settings(config)
+        max_queue = printing_cfg.get("max_spool_queue", 3)
+        spooler_query_timeout = printing_cfg.get("spooler_query_timeout", 5.0)
+        resolved_printer = str(target_printer or "").strip()
+        if not resolved_printer:
+            resolved_printer, _ = config_manager.get_configured_printer(config)
+
+        if not resolved_printer:
+            logger.warning("[!] Warning: No Windows printer available for direct browser printing.")
+            return False, f"No Windows printer available for direct browser printing of #{num}."
+
+        if pm.classify_printer(resolved_printer) == "VIRTUAL":
+            logger.warning(
+                f"[!] Warning: '{resolved_printer}' is a VIRTUAL printer and cannot be used for direct physical printing."
+            )
+            return False, f"Target printer '{resolved_printer}' is VIRTUAL and cannot be used for direct printing."
+
+        def _gate_on_poll(spool_status):
+            if in_flight:
+                try:
+                    try:
+                        pm.reconcile_in_flight_jobs(
+                            resolved_printer,
+                            in_flight,
+                            db_path,
+                            status=spool_status,
+                            spooler_query_timeout=spooler_query_timeout,
+                        )
+                    except TypeError:
+                        pm.reconcile_in_flight_jobs(resolved_printer, in_flight, db_path, status=spool_status)
+                except Exception as rec_err:
+                    logger.debug("Queue gate poll reconcile skipped for #%s: %s", num, rec_err)
+
+        try:
+            try:
+                gate_ok = pm.enforce_queue_gate(
+                    resolved_printer,
+                    max_jobs=max_queue,
+                    on_poll=_gate_on_poll if in_flight is not None else None,
+                    check_abort_fn=check_abort,
+                    spooler_query_timeout=spooler_query_timeout,
+                )
+            except TypeError:
+                gate_ok = pm.enforce_queue_gate(resolved_printer, max_jobs=max_queue)
+        except KeyboardInterrupt:
+            if getattr(pm, "LAST_GATE_PROMPTED", False):
+                restore_erp_focus(timings)
+            logger.warning("Direct print aborted by user during print queue gate for complaint #%s.", num)
+            return False, "Process aborted by user during print queue gate."
+
+        gate_was_interactive = bool(getattr(pm, "LAST_GATE_PROMPTED", False)) or not gate_ok
+        if gate_was_interactive:
+            restore_erp_focus(timings)
+        if not gate_ok:
+            logger.info(f"[i] Direct browser printing skipped for complaint #{num} by operator.")
+            return False, f"Direct browser printing skipped for complaint #{num} by operator."
+
     # Runtime Defense-in-Depth: when progress tracking is enabled (Bulk Mode),
     # if a valid non-empty PDF already exists on disk, backfill SQLite and skip ERP GUI download.
-    if record_progress:
+    if record_progress and not direct_print:
         existing_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
         if existing_pdf:
             record_completed_complaint(db_path, num, technician=tech, file_path=existing_pdf)
@@ -305,6 +388,143 @@ def process_complaint(complaint_no, tech_name, config=None, record_progress=True
                 return False, "Process aborted by user (Esc pressed)."
             time.sleep(0.5)
             elapsed += 0.5
+
+        if direct_print:
+            # Step F (Direct Browser Print): snapshot active spool jobs, press Ctrl+P -> Enter,
+            # wait for win32print spool verification without opening any Save As modal.
+            prior_status = pm._call_get_queue_status(resolved_printer, timeout=spooler_query_timeout)
+            prior_job_ids = {
+                j.get("job_id")
+                for j in (prior_status.get("jobs") or [])
+                if isinstance(j.get("job_id"), int)
+                and not isinstance(j.get("job_id"), bool)
+                and j.get("job_id") > 0
+            }
+
+            logger.info(f"[*] Direct Print: Pressing Ctrl+P for #{num} -> '{resolved_printer}'...")
+            pyautogui.hotkey('ctrl', 'p')
+            time.sleep(timings.get("foxit_print_dialog_seconds", 2.5))
+
+            if check_abort():
+                return False, "Process aborted by user (Esc pressed)."
+
+            # Clicks 'OK' / Print on the Foxit Print menu (defaults to physical printer)
+            pyautogui.press('enter')
+
+            spool_wait_timeout = timings.get("direct_print_spool_seconds", 3.0)
+            try:
+                spool_ok, detected_job_id, spool_msg = pm.wait_for_direct_print_spool(
+                    resolved_printer,
+                    prior_job_ids=prior_job_ids,
+                    timeout=spool_wait_timeout,
+                    min_wait=min(2.0, float(spool_wait_timeout)),
+                    check_abort_fn=check_abort,
+                    spooler_query_timeout=spooler_query_timeout,
+                )
+            except TypeError:
+                spool_ok, detected_job_id, spool_msg = pm.wait_for_direct_print_spool(
+                    resolved_printer,
+                    prior_job_ids=prior_job_ids,
+                    timeout=spool_wait_timeout,
+                )
+
+            if not spool_ok and "aborted" in spool_msg.lower():
+                return False, spool_msg
+
+            if check_abort():
+                return False, "Process aborted by user (Esc pressed)."
+
+            # Step G: Return focus to ERP and close Print Module popup
+            restore_erp_focus(timings)
+
+            logger.info("[*] Closing the Print Module...")
+            popup_exit = coords.get("popup_exit_btn", {"x": 749, "y": 493})
+            pyautogui.click(x=popup_exit["x"], y=popup_exit["y"])
+            time.sleep(timings.get("popup_close_seconds", 1.0))
+
+            if not spool_ok:
+                if record_progress:
+                    try:
+                        state_manager.mark_complaint_print_failed(
+                            db_path,
+                            num,
+                            file_path="",
+                            printer_name=resolved_printer,
+                            job_id=detected_job_id,
+                            reason=spool_msg,
+                            technician=tech,
+                        )
+                    except Exception as state_err:
+                        logger.debug("Could not mark PRINT_FAILED for #%s: %s", num, state_err)
+                logger.error(f"[!] Direct print spool verification failed for #{num}: {spool_msg}")
+                return False, f"Direct browser printing failed for #{num}: {spool_msg}"
+
+            if record_progress:
+                still_active = False
+                matched_doc_name = None
+                if detected_job_id is not None and in_flight is not None:
+                    cur_status = pm._call_get_queue_status(resolved_printer, timeout=spooler_query_timeout)
+                    matched_job = pm._find_matching_job_in_status(cur_status, job_id=detected_job_id)
+                    if matched_job is not None:
+                        j_state, j_reason = pm.inspect_job_in_status(cur_status, job_id=detected_job_id)
+                        if j_state == "FAILED":
+                            try:
+                                state_manager.mark_complaint_print_failed(
+                                    db_path,
+                                    num,
+                                    file_path="",
+                                    printer_name=resolved_printer,
+                                    job_id=detected_job_id,
+                                    reason=j_reason,
+                                    technician=tech,
+                                )
+                            except Exception as state_err:
+                                logger.debug("Could not mark PRINT_FAILED for #%s: %s", num, state_err)
+                            logger.error(f"[!] Direct print job #{detected_job_id} failed for #{num}: {j_reason}")
+                            return False, f"Direct browser printing failed for #{num}: {j_reason}"
+                        if j_state == "PENDING":
+                            still_active = True
+                            matched_doc_name = matched_job.get("document")
+
+                if still_active:
+                    pm.mark_complaint_spooled(
+                        db_path,
+                        num,
+                        file_path="",
+                        printer_name=resolved_printer,
+                        job_id=detected_job_id,
+                        technician=tech,
+                    )
+                    in_flight.append(
+                        {
+                            "complaint_no": num,
+                            "file_path": "",
+                            "job_id": detected_job_id,
+                            "doc_name": matched_doc_name,
+                            "technician": tech,
+                        }
+                    )
+                    logger.info(
+                        f"[*] Complaint #{num} spooled directly to '{resolved_printer}' "
+                        f"(Job #{detected_job_id}; sliding window: {len(in_flight)}/{max_queue})."
+                    )
+                else:
+                    pm.mark_complaint_printed(
+                        db_path,
+                        num,
+                        file_path="",
+                        printer_name=resolved_printer,
+                        job_id=detected_job_id,
+                        technician=tech,
+                    )
+                    logger.info(
+                        f"[✓] Complaint #{num} direct-printed on '{resolved_printer}' (recorded in SQLite)."
+                    )
+            else:
+                logger.info(f"[✓] Complaint #{num} sent directly to '{resolved_printer}'!")
+
+            time.sleep(1.0)
+            return True, f"{num} direct-printed successfully on '{resolved_printer}'."
 
         # Step F: Print & Save as PDF
         logger.info(f"[*] Pressing Ctrl+P for {tech}...")
@@ -513,11 +733,21 @@ def _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech):
     return None
 
 
-def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=True, live_print=False):
+def run_batch(
+    records_iterable,
+    config=None,
+    start_delay=5,
+    organize_by_tech=True,
+    live_print=False,
+    direct_print=False,
+    target_printer=None,
+):
     """
     Executes batch processing for an iterable of (complaint_no, tech_name) records.
     Returns summary statistics dict: {'total', 'completed', 'skipped', 'failed', 'aborted'}.
     """
+    import printer_manager as pm
+
     reset_abort()
     config_manager.set_dpi_awareness()
     if config is None:
@@ -527,18 +757,42 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
 
     settings = config.get("settings", config_manager.DEFAULT_CONFIG["settings"])
     timings = config.get("timings", config_manager.DEFAULT_CONFIG["timings"])
+    printing_cfg = config_manager.get_printing_settings(config)
+    spooler_query_timeout = printing_cfg.get("spooler_query_timeout", 5.0)
     output_base = config_manager.resolve_path(settings.get("output_dir", "Today_Complaints"))
-    db_path = state_manager.ensure_tracker_db_ready(config, tracker_kind="completed", output_dir=output_base)
+    db_path = state_manager.ensure_tracker_db_ready(
+        config, tracker_kind="printed" if direct_print else "completed", output_dir=output_base
+    )
     completed_set = get_completed_complaints(db_path)
 
     printed_set = set()
-    if live_print:
-        import printer_manager as pm
+    if live_print or direct_print:
         try:
             printed_set = pm.load_printed_complaints(db_path)
         except Exception as e:
             logger.warning(f"[!] Warning: Could not load printed tracker from '{db_path}': {e}")
             printed_set = set()
+
+    resolved_printer = None
+    default_printer_target = None
+    if direct_print:
+        resolved_printer = str(target_printer or "").strip()
+        if not resolved_printer:
+            resolved_printer, _ = config_manager.get_configured_printer(config)
+        if not resolved_printer or pm.classify_printer(resolved_printer) == "VIRTUAL":
+            logger.error("[!] Direct Browser Print aborted: No valid physical target printer configured.")
+            return {
+                "total": len(list(records_iterable)),
+                "completed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "aborted": True,
+            }
+        default_printer_target = resolved_printer
+    else:
+        installed_printers = pm.get_installed_printers()
+        if "Microsoft Print to PDF" in installed_printers:
+            default_printer_target = "Microsoft Print to PDF"
 
     records = list(records_iterable)
     stats = {
@@ -549,42 +803,163 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
         "aborted": False
     }
 
-    routing_label = "Per-Technician Folders" if organize_by_tech else "All_PDFs (Unified Folder)"
+    in_flight = []
+    spooled_pending = set()
+
+    def _sync_spooled_pending():
+        if not spooled_pending:
+            return
+        active_ids = {item.get("complaint_no") for item in in_flight}
+        finished_ids = [cid for cid in list(spooled_pending) if cid not in active_ids]
+        for cid in finished_ids:
+            spooled_pending.discard(cid)
+            rec = state_manager.get_complaint_record(cid, db_path)
+            if rec and rec.get("status") == "PRINTED":
+                printed_set.add(cid)
+                stats["completed"] += 1
+            else:
+                printed_set.discard(cid)
+                stats["failed"] += 1
+
     logger.info(f"\n[*] Batch Execution Initialized: {len(records)} total records.")
-    logger.info(f"[*] Folder Routing: {routing_label}")
-    logger.info(f"Auto-resume: {len(completed_set)} already completed records found.")
+    if direct_print:
+        logger.info(f"[*] Workflow Mode: Direct Browser Print (No PDF Save) -> '{resolved_printer}'")
+        logger.info(f"Auto-resume (Direct Print): {len(printed_set)} already printed records found.")
+    else:
+        routing_label = "Per-Technician Folders" if organize_by_tech else "All_PDFs (Unified Folder)"
+        logger.info(f"[*] Folder Routing: {routing_label}")
+        logger.info(f"Auto-resume: {len(completed_set)} already completed records found.")
     logger.info(f"Starting in {start_delay} seconds! Please ensure your ERP window is open and maximized...")
 
     try:
-        for i in range(start_delay, 0, -1):
-            if check_abort():
-                logger.warning("\n[!] Aborted during countdown.")
-                stats["aborted"] = True
-                return stats
-            print(f"  Countdown: {i}...")
-            time.sleep(1.0)
+        with pm.temporary_default_printer(default_printer_target):
+            for i in range(start_delay, 0, -1):
+                if check_abort():
+                    logger.warning("\n[!] Aborted during countdown.")
+                    stats["aborted"] = True
+                    return stats
+                print(f"  Countdown: {i}...")
+                time.sleep(1.0)
 
-        for idx, (complaint_no, tech_name) in enumerate(records, 1):
-            num = str(complaint_no).strip()
-            tech = sanitize_technician_name(tech_name)
+            for idx, (complaint_no, tech_name) in enumerate(records, 1):
+                num = str(complaint_no).strip()
+                tech = sanitize_technician_name(tech_name)
 
-            if check_abort():
-                logger.warning("\n[!] Batch processing stopped by User (Esc pressed).")
-                stats["aborted"] = True
-                break
+                if check_abort():
+                    logger.warning("\n[!] Batch processing stopped by User (Esc pressed).")
+                    stats["aborted"] = True
+                    break
 
-            if num in completed_set:
-                if not live_print or num in printed_set:
-                    logger.info(f"[>>] [{idx}/{len(records)}] {num} already done. Skipping...")
-                    stats["skipped"] += 1
+                if direct_print:
+                    if in_flight:
+                        try:
+                            try:
+                                pm.reconcile_in_flight_jobs(
+                                    resolved_printer,
+                                    in_flight,
+                                    db_path,
+                                    spooler_query_timeout=spooler_query_timeout,
+                                )
+                            except TypeError:
+                                pm.reconcile_in_flight_jobs(resolved_printer, in_flight, db_path)
+                        except Exception as rec_err:
+                            logger.warning("Spooler reconciliation warning: %s", rec_err)
+                        _sync_spooled_pending()
+
+                    if num in printed_set:
+                        logger.info(f"[>>] [{idx}/{len(records)}] {num} already printed. Skipping...")
+                        stats["skipped"] += 1
+                        continue
+
+                    existing_disk_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+                    if existing_disk_pdf:
+                        record_completed_complaint(db_path, num, technician=tech, file_path=existing_disk_pdf)
+                        completed_set.add(num)
+                        logger.info(
+                            f"\n[->] [{idx}/{len(records)}] Existing PDF found on disk for #{num} (Tech: {tech}); printing directly..."
+                        )
+                        print_ok, print_msg = _dispatch_live_print(
+                            num, existing_disk_pdf, config, timings, target_printer=resolved_printer
+                        )
+                        if print_ok:
+                            printed_set.add(num)
+                            stats["completed"] += 1
+                        else:
+                            if "aborted" in print_msg.lower() or "failsafe" in print_msg.lower():
+                                stats["aborted"] = True
+                                break
+                            stats["failed"] += 1
+                        continue
+
+                    logger.info(f"\n[->] [{idx}/{len(records)}] Direct-Printing Complaint #: {num} (Tech: {tech})")
+                    success, msg = process_complaint(
+                        num,
+                        tech,
+                        config=config,
+                        record_progress=True,
+                        organize_by_tech=organize_by_tech,
+                        live_print=False,
+                        direct_print=True,
+                        target_printer=resolved_printer,
+                        in_flight=in_flight,
+                    )
+                    _sync_spooled_pending()
+
+                    if success:
+                        if any(item.get("complaint_no") == num for item in in_flight):
+                            spooled_pending.add(num)
+                        else:
+                            printed_set.add(num)
+                            stats["completed"] += 1
+                    else:
+                        if "aborted" in msg.lower() or "failsafe" in msg.lower():
+                            stats["aborted"] = True
+                            break
+                        elif "skipped" in msg.lower():
+                            stats["skipped"] += 1
+                        else:
+                            stats["failed"] += 1
                     continue
 
-                # Complaint PDF was completed previously, but is not marked PRINTED in SQLite.
-                # Retry physical printing from saved PDF if present on disk.
-                saved_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
-                if saved_pdf:
-                    logger.info(f"\n[->] [{idx}/{len(records)}] Retrying print for saved PDF #{num} (Tech: {tech})")
-                    print_ok, print_msg = _dispatch_live_print(num, saved_pdf, config, timings)
+                if num in completed_set:
+                    if not live_print or num in printed_set:
+                        logger.info(f"[>>] [{idx}/{len(records)}] {num} already done. Skipping...")
+                        stats["skipped"] += 1
+                        continue
+
+                    # Complaint PDF was completed previously, but is not marked PRINTED in SQLite.
+                    # Retry physical printing from saved PDF if present on disk.
+                    saved_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+                    if saved_pdf:
+                        logger.info(f"\n[->] [{idx}/{len(records)}] Retrying print for saved PDF #{num} (Tech: {tech})")
+                        print_ok, print_msg = _dispatch_live_print(num, saved_pdf, config, timings)
+                        if print_ok:
+                            printed_set.add(num)
+                            stats["completed"] += 1
+                        else:
+                            if "aborted" in print_msg.lower() or "failsafe" in print_msg.lower():
+                                stats["aborted"] = True
+                                break
+                            stats["failed"] += 1
+                        continue
+
+                # Runtime Defense-in-Depth: check if a valid non-empty PDF already exists on disk
+                # even if it was not yet registered in completed_set.
+                existing_disk_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+                if existing_disk_pdf:
+                    record_completed_complaint(db_path, num, technician=tech, file_path=existing_disk_pdf)
+                    completed_set.add(num)
+                    if not live_print or num in printed_set:
+                        logger.info(
+                            f"[>>] [{idx}/{len(records)}] {num} already exists on disk (synced to DB). Skipping..."
+                        )
+                        stats["skipped"] += 1
+                        continue
+
+                    logger.info(
+                        f"\n[->] [{idx}/{len(records)}] Existing PDF found on disk for #{num} (Tech: {tech}); synced to DB and printing..."
+                    )
+                    print_ok, print_msg = _dispatch_live_print(num, existing_disk_pdf, config, timings)
                     if print_ok:
                         printed_set.add(num)
                         stats["completed"] += 1
@@ -595,53 +970,55 @@ def run_batch(records_iterable, config=None, start_delay=5, organize_by_tech=Tru
                         stats["failed"] += 1
                     continue
 
-            # Runtime Defense-in-Depth: check if a valid non-empty PDF already exists on disk
-            # even if it was not yet registered in completed_set.
-            existing_disk_pdf = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
-            if existing_disk_pdf:
-                record_completed_complaint(db_path, num, technician=tech, file_path=existing_disk_pdf)
-                completed_set.add(num)
-                if not live_print or num in printed_set:
-                    logger.info(
-                        f"[>>] [{idx}/{len(records)}] {num} already exists on disk (synced to DB). Skipping..."
-                    )
-                    stats["skipped"] += 1
-                    continue
-
-                logger.info(
-                    f"\n[->] [{idx}/{len(records)}] Existing PDF found on disk for #{num} (Tech: {tech}); synced to DB and printing..."
+                logger.info(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
+                success, msg = process_complaint(
+                    num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech, live_print=live_print
                 )
-                print_ok, print_msg = _dispatch_live_print(num, existing_disk_pdf, config, timings)
-                if print_ok:
-                    printed_set.add(num)
+
+                # Update in-memory sets based on actual persisted state
+                saved_pdf_now = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
+                if saved_pdf_now:
+                    completed_set.add(num)
+
+                if success:
+                    completed_set.add(num)
+                    if live_print:
+                        printed_set.add(num)
                     stats["completed"] += 1
                 else:
-                    if "aborted" in print_msg.lower() or "failsafe" in print_msg.lower():
+                    if "aborted" in msg.lower() or "failsafe" in msg.lower():
                         stats["aborted"] = True
                         break
                     stats["failed"] += 1
-                continue
 
-            logger.info(f"\n[->] [{idx}/{len(records)}] Processing Complaint #: {num} (Tech: {tech})")
-            success, msg = process_complaint(
-                num, tech, config=config, record_progress=True, organize_by_tech=organize_by_tech, live_print=live_print
-            )
-
-            # Update in-memory sets based on actual persisted state
-            saved_pdf_now = _find_saved_pdf_for_complaint(num, tech, output_base, organize_by_tech)
-            if saved_pdf_now:
-                completed_set.add(num)
-
-            if success:
-                completed_set.add(num)
-                if live_print:
-                    printed_set.add(num)
-                stats["completed"] += 1
-            else:
-                if "aborted" in msg.lower() or "failsafe" in msg.lower():
+            # Final Drain Pass for Direct Browser Print sliding-window jobs
+            if direct_print and in_flight and not stats["aborted"]:
+                try:
+                    try:
+                        _, _, drain_aborted = pm.drain_in_flight_jobs(
+                            resolved_printer,
+                            in_flight,
+                            db_path,
+                            check_abort_fn=check_abort,
+                            spooler_query_timeout=spooler_query_timeout,
+                        )
+                    except TypeError:
+                        _, _, drain_aborted = pm.drain_in_flight_jobs(
+                            resolved_printer,
+                            in_flight,
+                            db_path,
+                            check_abort_fn=check_abort,
+                        )
+                    _sync_spooled_pending()
+                    if drain_aborted:
+                        stats["aborted"] = True
+                except KeyboardInterrupt:
+                    logger.warning("\n[!] Final spooler drain interrupted by user.")
                     stats["aborted"] = True
-                    break
-                stats["failed"] += 1
+                except Exception as drain_err:
+                    logger.error(f"\n[!] Error during final spooler drain: {drain_err}", exc_info=True)
+                    in_flight.clear()
+                    _sync_spooled_pending()
     except KeyboardInterrupt:
         logger.warning("\n[!] Batch processing interrupted by user (Ctrl+C).")
         stats["aborted"] = True
