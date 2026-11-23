@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (v6.2.0: Enterprise Architecture, Self-Updater & Batch Remarks PDF Stamping)
-**Document Version:** 2.1.0  
-**Status:** Completed (v6.2.0 — Phase 6–8: SQLite WAL State, In-App Self-Updater & Batch Technician Remarks PDF Stamping)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (v6.3.0: Direct Browser Print, Batch Remarks PDF Stamping & Self-Updater)
+**Document Version:** 2.2.0  
+**Status:** Completed (v6.3.0 — Phase 6–9: SQLite WAL State, In-App Self-Updater, Batch Remarks PDF Stamping & Direct Browser Print)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
@@ -96,24 +96,24 @@ flowchart TD
 ```
 
 #### 3.1 File & Module Responsibilities
-- **`state_manager.py`** *(NEW - COMPLETED)*:
+- **`state_manager.py`** *(UPDATED - COMPLETED)*:
   - Manages `complaints_state.db` in SQLite WAL mode with `busy_timeout=15000`.
   - Auto-migrates legacy `completed_complaints.txt` and `printed_complaints.txt` into SQLite and renames them to `.migrated.bak`.
-  - Provides transactional state mutations (`mark_complaint_downloaded`, `mark_complaint_spooled`, `mark_complaint_printed`, `mark_complaint_print_failed`, `reset_printed_tracker_safe`) and queries (`get_completed_complaints`, `load_printed_complaints`).
+  - Provides transactional state mutations (`mark_complaint_downloaded`, `mark_complaint_spooled`, `mark_complaint_printed`, `mark_complaint_print_failed`, `reset_printed_tracker_safe` which deletes direct-print rows with empty `file_path` and downgrades saved-PDF rows back to `DOWNLOADED`) and queries (`get_completed_complaints`, `load_printed_complaints`).
 - **`logger_manager.py`** *(NEW - COMPLETED)*:
   - Configures centralized `erp_automation` logger hierarchy with `RotatingFileHandler` (`logs/app.log`, 5 MB, 5 backups, UTF-8, `DEBUG`+) and console `StreamHandler` (`INFO`+), plus `sys.excepthook`.
 - **`printer_manager.py`** *(UPDATED - COMPLETED)*:
-  - Headless GDI PDF rendering via `pypdfium2` + `win32ui`, spooler queue monitoring, sliding-window reconciliation, and SQLite state persistence via `state_manager`.
+  - Headless GDI PDF rendering via `pypdfium2` + `win32ui`, `temporary_default_printer` OS default printer switching with guaranteed `try/finally` restoration, `wait_for_direct_print_spool` verification, spooler queue monitoring, sliding-window reconciliation, and SQLite state persistence via `state_manager`.
 - **`config_manager.py`** *(UPDATED - COMPLETED)*:
-  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness, and schema defaults/validation for `coordinates`, `timings`, `settings` (`database_file`), `printing`, `logging`, `updater`, and `remarks_stamping`.
+  - Path anchoring (`sys.executable` when frozen), Per-Monitor DPI awareness, and schema defaults/validation for `coordinates`, `timings` (including `direct_print_spool_seconds`), `settings` (`database_file`), `printing`, `logging`, `updater`, and `remarks_stamping`.
 - **`calibration_wizard.py`** *(UPDATED - COMPLETED)*:
   - Coordinate calibration for Print (5), OTP (4), or All (9) targets, and physical printer configuration with structured logging.
 - **`engine.py`** *(UPDATED - COMPLETED)*:
-  - Unified RPA loop for complaint extraction and PDF creation with global ESC key latching, `Ctrl+C` handling, SQLite progress tracking, and Live Print dispatch.
+  - Unified RPA loop for Save-PDF complaint extraction and Direct Browser Print (`direct_print=True`, skipping PDF Save As and pressing `Ctrl+P` -> `Enter` straight to the physical default printer with sliding-window `win32print` spool verification and final drain), with global ESC key latching, `Ctrl+C` handling, SQLite progress tracking, and Live Print dispatch.
 - **`pdf_remarks.py`** *(NEW - COMPLETED)*:
   - Batch Technician Remarks PDF stamping engine via PyMuPDF: validates `complaint_remarks.xlsx` (keep-last duplicate handling, blank-remark skip), recursively matches PDFs, anchors vertically to the Technician Remarks table border, overlays wrapped/auto-scaled Regular Helvetica (`9.5`–`6.0 pt`, `...` truncation fallback), saves atomically into mirrored `Stamped_Complaints/` folders, and exports `logs/remarks_report_*.csv` on missing/truncated/error rows.
 - **`main.py`** *(UPDATED - COMPLETED)*:
-  - Primary menu (`[1]`–`[8]`, `[U]`), strict Excel validation & Pre-Flight Validation Summary (`validate_excel_dataframe`, `validate_and_load_excel_records`), Batch Remarks Stamping (`[7]`), and SQLite-backed Offline Batch Print (`[5]`) with `Today_Complaints` / `Stamped_Complaints` source switching (`[S]`).
+  - Primary menu (`[1]`–`[8]`, `[U]`), print workflow mode selector (`_prompt_print_workflow_mode` for Save PDF vs Direct Browser Print in `[1]` Bulk and `[2]` Manual modes), strict Excel validation & Pre-Flight Validation Summary (`validate_excel_dataframe`, `validate_and_load_excel_records`), Batch Remarks Stamping (`[7]`), and SQLite-backed Offline Batch Print (`[5]`) with `Today_Complaints` / `Stamped_Complaints` source switching (`[S]`).
 - **`updater.py`** *(UPDATED - COMPLETED)*:
   - GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap while protecting runtime data including `Stamped_Complaints/` and `complaint_remarks.xlsx`.
 - **`build.py`** *(UPDATED - COMPLETED)*:
@@ -147,6 +147,7 @@ flowchart TD
     "checkbox_wait_seconds": 1.0,
     "browser_pdf_load_seconds": 8.0,
     "foxit_print_dialog_seconds": 2.5,
+    "direct_print_spool_seconds": 3.0,
     "save_dialog_seconds": 3.0,
     "file_save_processing_seconds": 4.0,
     "window_switch_seconds": 2.0,
@@ -225,3 +226,4 @@ flowchart TD
 | **6.5** | **Packaging & Documentation** | **COMPLETED** | Update `build.py` runtime preservation for SQLite/logs and synchronize `PRD.md` & `README.md`. |
 | **Phase 7** | **In-App Self-Updater (`updater.py`, `version.py`)** | **COMPLETED** | GitHub Releases API polling, SHA-256 verification, detached `.bat` swap with rollback protection, `[U]` CLI menu, and `build.py` release ZIP automation. |
 | **Phase 8** | **Batch Technician Remarks PDF Stamping (`pdf_remarks.py`)** | **COMPLETED** | PyMuPDF remarks stamping (`[7]`), dynamic border anchoring, font auto-scaling/truncation, mirrored `Stamped_Complaints/` output, `[5]` source switching, and CSV issue reporting. |
+| **Phase 9** | **Direct Browser Print (`engine.py`, `printer_manager.py`)** | **COMPLETED** | Workflow selector (`[1]` Save PDF vs `[2]` Direct Print) in Bulk `[1]` & Manual `[2]`, `temporary_default_printer` `try/finally` guard, sliding-window `win32print` spool verification, and direct-print reset handling. |

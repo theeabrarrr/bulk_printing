@@ -1,8 +1,13 @@
-# Oracle ERP Automation Suite (v6.2.0: Remarks PDF Stamping, In-App Self-Updater, Enterprise SQLite State & Silent Printing)
+# Oracle ERP Automation Suite (v6.3.0: Direct Browser Printing, Remarks PDF Stamping, In-App Self-Updater & Enterprise SQLite State)
 
-An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader, automatically sorts them into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), stamps technician remarks onto matching PDFs (`Stamped_Complaints/`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
+An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader (or sends print jobs straight to a physical printer with **Direct Browser Print**), automatically sorts saved PDFs into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), stamps technician remarks onto matching PDFs (`Stamped_Complaints/`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
 
-## Key Enterprise Features (v6.2.0)
+## Key Enterprise Features (v6.3.0)
+- **Direct Browser Print (No PDF Save) & OS Default Printer Guard (`engine.py`, `printer_manager.py`, `main.py`)**:
+  - In **Bulk Mode (`[1]`)** and **Manual Mode (`[2]`)**, operators choose between **`[1] Save PDF to Disk`** (existing `Today_Complaints/` workflow) and **`[2] Direct Browser Print (No PDF Save - Straight to Printer)`**.
+  - **Automatic Windows OS Default Printer Guard (`temporary_default_printer`)**: Temporarily sets the Windows OS default printer (`win32print.SetDefaultPrinter`) to the validated physical printer during Direct Browser Print (or `Microsoft Print to PDF` during Save PDF mode) and strictly restores the original OS default printer inside a `try/finally` block on completion, error, or abort (`[ESC]` / `Ctrl+C`).
+  - **Sliding-Window `win32print` Spool Verification**: Captures prior spooler job IDs, submits browser `Ctrl+P`, verifies new spool entries and hardware status via `wait_for_direct_print_spool` (with configurable `direct_print_spool_seconds`), enforces the `max_spool_queue` window via `enforce_queue_gate`, reconciles in-flight jobs (`SPOOLED` -> `PRINTED` or `PRINT_FAILED`) in `complaints_state.db`, and drains remaining spooled jobs at batch completion.
+  - **Direct-Print Tracker Reset (`[R]` in Mode `[5]`)**: Creates a timestamped `.db.bak` snapshot, deletes direct-print rows that have an empty `file_path` so they can be re-printed cleanly from the ERP, and downgrades saved-PDF rows (`file_path != ''`) back to `DOWNLOADED`.
 - **In-App Self-Updater & Atomic Binary Swap (`updater.py`, `version.py`)**:
   - Performs a fast (3-second timeout) non-blocking update check against GitHub Releases on startup and offers an on-demand **`[U] Check for Updates`** menu option.
   - Downloads release archives (`ERP_Automation_Suite_vX.Y.Z.zip`), verifies SHA-256 checksum integrity, and spawns a detached Windows helper (`_run_update.bat`) that waits for the active process to exit (`tasklist`), atomically replaces `ERP_Automation_Suite.exe` and `_internal/` with rollback protection, and restarts automatically while strictly preserving `config.json`, `complaints_state.db`, `complaints.xlsx`, `complaint_remarks.xlsx`, `Today_Complaints/`, `Stamped_Complaints/`, and `logs/`.
@@ -43,8 +48,8 @@ Ensure the following items are in the `ERP_Automation_Suite` folder:
 2. Make sure `complaints.xlsx` is **closed** in Microsoft Excel.
 3. Double-click **`ERP_Automation_Suite.exe`**.
 4. Choose an option from the Main Menu:
-   - **`[1] Bulk Mode (Process complaints.xlsx)`**: Validates and sanitizes `complaints.xlsx`, displays the Pre-Flight Validation Summary, prompts whether to sort PDFs into per-technician folders or a unified folder (`Today_Complaints/All_PDFs/`), and prompts whether to enable Live Physical Printing.
-   - **`[2] Manual Mode (Process single/batch complaint #s)`**: Prompts for one or multiple comma/space-separated complaint numbers (e.g. `2826001 2826002, 2826003`), deduplicates them, and processes them sequentially with optional live physical printing.
+   - **`[1] Bulk Mode (Process complaints.xlsx)`**: Validates and sanitizes `complaints.xlsx`, displays the Pre-Flight Validation Summary, lets you select **`[1] Save PDF to Disk`** (with technician/unified folder sorting and optional Live Physical Printing) or **`[2] Direct Browser Print (No PDF Save)`** straight to a validated physical printer with `win32print` spool verification.
+   - **`[2] Manual Mode (Process single/batch complaint #s)`**: Prompts for one or multiple comma/space-separated complaint numbers (e.g. `2826001 2826002, 2826003`), deduplicates them, lets you choose **`[1] Save PDF to Disk`** or **`[2] Direct Browser Print (No PDF Save)`**, and processes them sequentially with temporary OS default printer switching and automatic `try/finally` restoration.
    - **`[3] Recalibrate Coordinates (Setup Wizard)`**: Guided wizard to calibrate screen coordinates or configure physical printer and queue limits.
    - **`[4] Generate OTP (Interactive Mode)`**: Prompts for complaint numbers and automates OTP generation in Oracle Forms in a continuous loop.
    - **`[5] Batch Print Offline PDFs (Today_Complaints / Stamped)`**: Lists Technician folders with `[Total | Printed | Pending]` counts backed by `complaints_state.db`, lets you select or switch (`[S]`) between `Today_Complaints/` (original) and `Stamped_Complaints/` (with technician remarks), and silent-prints unprinted documents using a progress-aware sliding-window spooler pipeline.
@@ -91,20 +96,20 @@ python -B build.py
 # Or build and automatically publish the GitHub Release via GitHub CLI:
 python -B build.py --publish
 ```
-This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` (bundling `pypdfium2` and `pymupdf`) while preserving existing `config.json`, `complaints.xlsx`, `complaint_remarks.xlsx`, `complaints_state.db`, `logs/`, `Today_Complaints/`, and `Stamped_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.2.0.zip` + `.sha256` checksum.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` (bundling `pypdfium2` and `pymupdf`) while preserving existing `config.json`, `complaints.xlsx`, `complaint_remarks.xlsx`, `complaints_state.db`, `logs/`, `Today_Complaints/`, and `Stamped_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.3.0.zip` + `.sha256` checksum.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
-| `main.py` | Entry point, CLI menu router (`[1]`–`[8]`, `[U]`), strict Excel validation & Pre-Flight Summary, Batch Remarks Stamping `[7]`, and Batch Print mode `[5]` (`Today_Complaints` / `Stamped_Complaints`). |
+| `main.py` | Entry point, CLI menu router (`[1]`–`[8]`, `[U]`), print workflow mode selector (`Save PDF` vs `Direct Browser Print`), strict Excel validation & Pre-Flight Summary, Batch Remarks Stamping `[7]`, and Batch Print mode `[5]` (`Today_Complaints` / `Stamped_Complaints`). |
 | `pdf_remarks.py` | PyMuPDF batch remarks stamping engine: Excel validation, dynamic border anchoring, font auto-scaling (`9.5`–`6.0 pt`) with word-boundary truncation, atomic saves, and CSV issue reporting. |
-| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.2.0"`), SemVer comparisons, and release asset naming. |
+| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.3.0"`), SemVer comparisons, and release asset naming. |
 | `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper (preserving `Stamped_Complaints/` and `complaint_remarks.xlsx`). |
-| `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, and legacy `.txt` auto-migrator. |
+| `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, direct-print vs saved-PDF reset logic, and legacy `.txt` auto-migrator. |
 | `logger_manager.py` | Centralized logging manager with `RotatingFileHandler` (`logs/app.log`, 5 MB x 5 backups), console stream formatting, and crash hook. |
-| `printer_manager.py` | Modular printing engine: printer enumeration, spooler queue monitoring, queue gate failsafe, headless GDI printing, and job reconciliation. |
+| `printer_manager.py` | Modular printing engine: printer enumeration, `temporary_default_printer` OS default switching/restoration, `wait_for_direct_print_spool` verification, spooler queue monitoring, queue gate failsafe, headless GDI printing, and job reconciliation. |
 | `config_manager.py` | Portable path anchoring (`sys.executable`), Per-Monitor DPI awareness, and unified schema validation (`coordinates`, `timings`, `settings`, `printing`, `logging`, `updater`, `remarks_stamping`). |
 | `calibration_wizard.py` | Guided wizard for coordinate capture (Space/F8) and physical printer configuration. |
-| `engine.py` | Unified RPA loop for PDF generation, Live Print dispatch & focus restoration, and isolated `generate_otp()` sequence. |
+| `engine.py` | Unified RPA loop for Save-PDF extraction, Direct Browser Print (`direct_print=True`) with sliding-window spool tracking, Live Print dispatch & focus restoration, and isolated `generate_otp()` sequence. |
 | `build.py` | PyInstaller build script compiling standalone `--onedir` distribution, release `.zip` + `.sha256`, and optional `--publish` release automation. |
 | `legacy/masterbot.py` | Original Phase 2 baseline script (archived & preserved untouched). |
