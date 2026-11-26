@@ -2,6 +2,14 @@
 
 All notable changes to **ERP_Automation_Suite** are documented in this file.
 
+## [Unreleased]
+### Fixed
+- **Hardened Interactive OTP Generation Mode (`[4]`, `engine.py`, `main.py`, `config_manager.py`, `config.json`)**:
+  - Split `otp_query_wait_seconds` (default `2.5` s) from `otp_enter_delay_seconds` (default `0.4` s) and moved all hardcoded OTP delays (`otp_start_countdown_seconds`, `otp_input_focus_delay_seconds`, `otp_post_paste_delay_seconds`, `otp_modal_close_timeout_seconds`, `otp_post_select_delay_seconds`, `otp_between_complaints_seconds`) into `config.json` (`timings`) with a type-safe `get_timings_settings()` validator.
+  - Added `[ESC]`-responsive `sleep_interruptible()`, Edge IE Mode / Java Applet foreground window verification (`verify_erp_foreground`), and zero-calibration screen-bounds-clamped visual modal transition guards (`_wait_for_region_change`, `_wait_for_region_restore`) across all 6 OTP stages to prevent runaway clicking when Oracle Forms lags or displays an alert popup.
+  - Added numeric input sanitization and deduplication (`sanitize_otp_complaint_inputs`) in `run_otp_mode()`, immediate batch halt with an audible alert chime on any failure, and a copy-pasteable summary of remaining complaint IDs.
+  - Added 9 automated unit tests in `test/test_otp_mode.py`.
+
 ## [6.3.0] - 2026-11-23
 ### Added
 - **Direct Browser Print (No PDF Save) Workflow (`main.py`, `engine.py`, `config.json`, `config_manager.py`)**:
