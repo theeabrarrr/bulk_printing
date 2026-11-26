@@ -34,10 +34,17 @@ DEFAULT_CONFIG = {
         "file_save_processing_seconds": 4.0,
         "window_switch_seconds": 2.0,
         "popup_close_seconds": 1.0,
+        "otp_start_countdown_seconds": 3.0,
         "otp_window_open_seconds": 1.5,
-        "otp_search_modal_seconds": 1.2,
+        "otp_search_modal_seconds": 1.5,
+        "otp_input_focus_delay_seconds": 0.3,
+        "otp_post_paste_delay_seconds": 0.5,
+        "otp_query_wait_seconds": 2.5,
+        "otp_modal_close_timeout_seconds": 3.0,
+        "otp_post_select_delay_seconds": 1.5,
         "otp_reason_focus_seconds": 1.0,
-        "otp_enter_delay_seconds": 0.3
+        "otp_enter_delay_seconds": 0.4,
+        "otp_between_complaints_seconds": 1.5
     },
     "settings": {
         "excel_path": "complaints.xlsx",
@@ -45,7 +52,9 @@ DEFAULT_CONFIG = {
         "technician_column": "TECHNICIAN_NAME",
         "output_dir": "Today_Complaints",
         "progress_file": "completed_complaints.txt",
-        "database_file": "complaints_state.db"
+        "database_file": "complaints_state.db",
+        "otp_verify_screen_transitions": True,
+        "otp_screen_diff_threshold": 0.03
     },
     "printing": {
         "printer_name": None,
@@ -404,6 +413,120 @@ def _parse_nonempty_str(val, default):
         return default
     s = str(val).strip()
     return s if s else default
+
+
+def get_timings_settings(config=None):
+    """
+    Returns the timings configuration dictionary with default fallbacks and type-safe bounds.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    timings_cfg = config.get("timings", {}) if isinstance(config, dict) else {}
+    if not isinstance(timings_cfg, dict):
+        timings_cfg = {}
+    default_timings = DEFAULT_CONFIG["timings"]
+
+    zero_allowed_keys = {
+        "otp_start_countdown_seconds",
+        "otp_between_complaints_seconds",
+    }
+    min_bounds = {
+        "otp_start_countdown_seconds": 0.0,
+        "otp_between_complaints_seconds": 0.0,
+        "otp_input_focus_delay_seconds": 0.05,
+        "otp_post_paste_delay_seconds": 0.05,
+        "otp_enter_delay_seconds": 0.05,
+        "focus_delay": 0.05,
+        "otp_window_open_seconds": 0.1,
+        "otp_search_modal_seconds": 0.1,
+        "otp_query_wait_seconds": 0.1,
+        "otp_modal_close_timeout_seconds": 0.2,
+        "otp_post_select_delay_seconds": 0.1,
+        "otp_reason_focus_seconds": 0.1,
+    }
+
+    merged = {}
+    for k, default_val in default_timings.items():
+        raw_val = timings_cfg.get(k, default_val)
+        parsed = _parse_finite_float(raw_val, None)
+        if parsed is None:
+            merged[k] = float(default_val)
+            continue
+        if k in zero_allowed_keys:
+            if parsed < 0.0:
+                merged[k] = float(default_val)
+            else:
+                merged[k] = float(parsed)
+        else:
+            if parsed <= 0.0:
+                merged[k] = float(default_val)
+            else:
+                floor_val = min_bounds.get(k, 0.05)
+                merged[k] = max(floor_val, float(parsed))
+
+    return merged
+
+
+def get_otp_guard_settings(config=None):
+    """
+    Returns OTP screen-transition verification settings with safe defaults and bounds.
+    """
+    if config is None:
+        config = load_config() or DEFAULT_CONFIG
+
+    settings_cfg = config.get("settings", {}) if isinstance(config, dict) else {}
+    if not isinstance(settings_cfg, dict):
+        settings_cfg = {}
+    timings_cfg = config.get("timings", {}) if isinstance(config, dict) else {}
+    if not isinstance(timings_cfg, dict):
+        timings_cfg = {}
+
+    default_settings = DEFAULT_CONFIG["settings"]
+    default_verify = default_settings.get("otp_verify_screen_transitions", True)
+    default_thresh = default_settings.get("otp_screen_diff_threshold", 0.03)
+
+    if "otp_verify_screen_transitions" in settings_cfg:
+        raw_verify = settings_cfg.get("otp_verify_screen_transitions")
+    elif "otp_verify_screen_transitions" in timings_cfg:
+        raw_verify = timings_cfg.get("otp_verify_screen_transitions")
+    else:
+        raw_verify = default_verify
+
+    if raw_verify is None:
+        verify_bool = bool(default_verify)
+    elif isinstance(raw_verify, bool):
+        verify_bool = raw_verify
+    elif isinstance(raw_verify, str):
+        low = raw_verify.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            verify_bool = True
+        elif low in ("0", "false", "no", "off"):
+            verify_bool = False
+        else:
+            verify_bool = bool(default_verify)
+    elif isinstance(raw_verify, (int, float)):
+        verify_bool = bool(raw_verify)
+    else:
+        verify_bool = bool(default_verify)
+
+    if "otp_screen_diff_threshold" in settings_cfg:
+        raw_thresh = settings_cfg.get("otp_screen_diff_threshold")
+    elif "otp_screen_diff_threshold" in timings_cfg:
+        raw_thresh = timings_cfg.get("otp_screen_diff_threshold")
+    else:
+        raw_thresh = default_thresh
+
+    parsed_thresh = _parse_finite_float(raw_thresh, None)
+    if parsed_thresh is None or parsed_thresh <= 0.0 or parsed_thresh > 1.0:
+        thresh_val = float(default_thresh)
+    else:
+        thresh_val = max(0.005, min(0.50, float(parsed_thresh)))
+
+    return {
+        "otp_verify_screen_transitions": verify_bool,
+        "otp_screen_diff_threshold": thresh_val,
+    }
 
 
 def get_remarks_stamping_settings(config=None):

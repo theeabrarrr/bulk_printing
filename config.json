@@ -26,10 +26,17 @@
     "file_save_processing_seconds": 4.0,
     "window_switch_seconds": 2.0,
     "popup_close_seconds": 1.0,
+    "otp_start_countdown_seconds": 3.0,
     "otp_window_open_seconds": 1.5,
-    "otp_search_modal_seconds": 1.2,
+    "otp_search_modal_seconds": 1.5,
+    "otp_input_focus_delay_seconds": 0.3,
+    "otp_post_paste_delay_seconds": 0.5,
+    "otp_query_wait_seconds": 2.5,
+    "otp_modal_close_timeout_seconds": 3.0,
+    "otp_post_select_delay_seconds": 1.5,
     "otp_reason_focus_seconds": 1.0,
-    "otp_enter_delay_seconds": 0.3
+    "otp_enter_delay_seconds": 0.4,
+    "otp_between_complaints_seconds": 1.5
   },
   "settings": {
     "excel_path": "complaints.xlsx",
@@ -37,7 +44,9 @@
     "technician_column": "TECHNICIAN_NAME",
     "output_dir": "Today_Complaints",
     "progress_file": "completed_complaints.txt",
-    "database_file": "complaints_state.db"
+    "database_file": "complaints_state.db",
+    "otp_verify_screen_transitions": true,
+    "otp_screen_diff_threshold": 0.03
   },
   "printing": {
     "printer_name": "HP LaserJet 400 M401 PCL 6 (Copy 1)",
