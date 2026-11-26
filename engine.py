@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import re
+import ctypes
 
 # Ensure Unicode output doesn't crash on standard Windows consoles (cp1252)
 if sys.platform == "win32":
@@ -14,11 +15,42 @@ if sys.platform == "win32":
 import pyautogui
 import keyboard
 import pyperclip
+from PIL import Image, ImageChops, ImageGrab
+
+try:
+    import win32gui
+    import win32process
+except ImportError:
+    win32gui = None
+    win32process = None
+
 import config_manager
 import logger_manager
 import state_manager
 
 logger = logger_manager.get_logger("engine")
+
+# Allowed foreground process names for Oracle Forms running in Edge IE Mode / Java Applet
+ERP_ALLOWED_PROCESS_NAMES = {
+    "jp2launcher.exe",
+    "java.exe",
+    "javaw.exe",
+    "msedge.exe",
+    "iexplore.exe",
+}
+
+# Process names corresponding to our CLI console / terminal host
+CONSOLE_PROCESS_NAMES = {
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "conhost.exe",
+    "windowsterminal.exe",
+    "openconsole.exe",
+    "erp_automation_suite.exe",
+    "python.exe",
+    "pythonw.exe",
+}
 
 # Ensure failsafe is active (slam mouse into any corner to emergency abort)
 pyautogui.FAILSAFE = True
@@ -65,6 +97,318 @@ def check_abort():
         logger.debug("Latched ESC abort signal consumed.")
         return True
     return False
+
+
+def sleep_interruptible(seconds, poll_interval=0.05):
+    """
+    Sleeps for `seconds` in short `poll_interval` chunks using time.monotonic(),
+    checking `check_abort()` on every tick so [ESC] aborts within ~50ms.
+    Returns True if aborted by [ESC], False if the full duration elapsed normally.
+    """
+    try:
+        total = max(0.0, float(seconds))
+    except (ValueError, TypeError):
+        total = 0.0
+
+    if check_abort():
+        return True
+    if total <= 0.0:
+        return False
+
+    step = max(0.01, float(poll_interval))
+    deadline = time.monotonic() + total
+    while True:
+        if check_abort():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        time.sleep(min(step, remaining))
+    return check_abort()
+
+
+def _get_process_name_by_pid(pid):
+    """
+    Resolves the lowercase executable filename (e.g., 'jp2launcher.exe', 'msedge.exe')
+    for a Windows PID using Win32 QueryFullProcessImageNameW. Returns '' on failure.
+    """
+    if not pid or sys.platform != "win32":
+        return ""
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h_proc:
+            return ""
+        try:
+            buf_len = ctypes.c_ulong(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(buf_len)):
+                return os.path.basename(buf.value).strip().lower()
+        finally:
+            kernel32.CloseHandle(h_proc)
+    except Exception:
+        pass
+    return ""
+
+
+def capture_foreground_window_context():
+    """
+    Captures metadata about the currently active Windows foreground window:
+    {'hwnd', 'pid', 'process_name', 'title', 'is_console'}.
+    Returns None if win32gui is unavailable or no foreground window exists.
+    """
+    if win32gui is None or win32process is None:
+        return None
+    try:
+        hwnd = int(win32gui.GetForegroundWindow() or 0)
+        if not hwnd:
+            return None
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        pid = int(pid or 0)
+        title = str(win32gui.GetWindowText(hwnd) or "").strip()
+        proc_name = _get_process_name_by_pid(pid)
+
+        console_hwnd = 0
+        if sys.platform == "win32":
+            try:
+                console_hwnd = int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+            except Exception:
+                console_hwnd = 0
+
+        title_low = title.lower()
+        is_console = (
+            pid == os.getpid()
+            or (console_hwnd != 0 and hwnd == console_hwnd)
+            or proc_name in CONSOLE_PROCESS_NAMES
+            or "oracle erp automation suite" in title_low
+            or title_low.startswith(
+                (
+                    "command prompt",
+                    "windows powershell",
+                    "administrator: command prompt",
+                    "administrator: windows powershell",
+                )
+            )
+        )
+        return {
+            "hwnd": hwnd,
+            "pid": pid,
+            "process_name": proc_name,
+            "title": title,
+            "is_console": bool(is_console),
+        }
+    except Exception as e:
+        logger.debug("Could not capture foreground window context: %s", e)
+        return None
+
+
+def verify_erp_foreground(expected_ctx):
+    """
+    Verifies that the active foreground window still belongs to Oracle Forms / Edge IE Mode / Java.
+    Allows windows whose PID matches `expected_ctx['pid']`, OR whose process name is in
+    ERP_ALLOWED_PROCESS_NAMES ({'jp2launcher.exe', 'java.exe', 'javaw.exe', 'msedge.exe', 'iexplore.exe'}),
+    OR whose window title contains 'Oracle' or 'Forms', while immediately halting if focus shifts
+    to the CLI console, Explorer, or any unrelated application.
+    Returns (is_ok: bool, error_message: str).
+    """
+    if expected_ctx is None or win32gui is None or win32process is None:
+        return True, ""
+
+    curr = capture_foreground_window_context()
+    if curr is None:
+        return False, "No active foreground window detected (ERP window lost focus)."
+
+    curr_pid = curr.get("pid", 0)
+    curr_proc = (curr.get("process_name") or "").lower()
+    curr_title = curr.get("title") or ""
+    curr_title_low = curr_title.lower()
+
+    if curr.get("is_console") or curr_pid == os.getpid() or curr_proc in CONSOLE_PROCESS_NAMES:
+        label = curr_title or curr_proc or f"PID {curr_pid}"
+        return False, f"ERP window lost focus to CLI console ('{label}')."
+
+    expected_pid = expected_ctx.get("pid")
+    if (
+        (expected_pid and curr_pid == expected_pid)
+        or (curr_proc in ERP_ALLOWED_PROCESS_NAMES)
+        or ("oracle" in curr_title_low or "forms" in curr_title_low)
+    ):
+        return True, ""
+
+    label = curr_title or curr_proc or f"PID {curr_pid}"
+    proc_detail = f" [{curr_proc}]" if curr_proc else ""
+    return False, f"ERP window lost focus (active window: '{label}'{proc_detail})."
+
+
+def _capture_region_patch(center_x, center_y, half_w=120, half_h=80):
+    """
+    Captures a grayscale ('L') screenshot patch around (center_x, center_y), clamping
+    the bounding box within [0, screen_width] and [0, screen_height] so patches near
+    screen edges never go out of bounds on 1366x768 displays.
+    Returns Optional[PIL.Image.Image].
+    """
+    try:
+        size = pyautogui.size()
+        screen_w = max(1, int(getattr(size, "width", size[0])))
+        screen_h = max(1, int(getattr(size, "height", size[1])))
+    except Exception:
+        screen_w, screen_h = 1366, 768
+
+    cx = int(center_x)
+    cy = int(center_y)
+    hw = max(8, int(half_w))
+    hh = max(8, int(half_h))
+
+    left = max(0, min(screen_w - 1, cx - hw))
+    top = max(0, min(screen_h - 1, cy - hh))
+    right = max(left + 1, min(screen_w, cx + hw))
+    bottom = max(top + 1, min(screen_h, cy + hh))
+    bbox = (left, top, right, bottom)
+
+    try:
+        try:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab(bbox=bbox)
+        return img.convert("L")
+    except Exception as e:
+        logger.debug("Screen patch capture failed at bbox=%s: %s", bbox, e)
+        return None
+
+
+def _compute_patch_diff_ratio(patch_a, patch_b, pixel_delta_threshold=18):
+    """
+    Computes the fraction of pixels (0.0 to 1.0) between two grayscale patches whose
+    intensity differs by at least `pixel_delta_threshold` (out of 255).
+    Ignores minor blinking caret changes (<0.1%) while reliably detecting modal transitions (>3%).
+    """
+    if patch_a is None or patch_b is None:
+        return 0.0
+    try:
+        a = patch_a.convert("L") if patch_a.mode != "L" else patch_a
+        b = patch_b.convert("L") if patch_b.mode != "L" else patch_b
+        if a.size != b.size:
+            b = b.resize(a.size)
+        diff = ImageChops.difference(a, b)
+        hist = diff.histogram()
+        total_px = max(1, a.width * a.height)
+        thresh_idx = max(1, min(255, int(pixel_delta_threshold)))
+        changed_px = sum(hist[thresh_idx:])
+        return float(changed_px) / float(total_px)
+    except Exception as e:
+        logger.debug("Error computing patch diff ratio: %s", e)
+        return 0.0
+
+
+def _wait_for_region_change(
+    center_pt,
+    baseline_patch,
+    timeout_seconds,
+    threshold=0.03,
+    min_settle=0.25,
+    expected_fg=None,
+    poll_interval=0.1,
+    half_w=120,
+    half_h=80,
+):
+    """
+    Polls until the screen region centered at `center_pt` changes by at least `threshold`
+    relative to `baseline_patch`. Checks `check_abort()` and `verify_erp_foreground()` on each tick.
+    Returns (status: str, diff_ratio: float, error_msg: str) where status is one of:
+    'CHANGED', 'ABORTED', 'FOCUS_LOST', 'TIMEOUT'.
+    """
+    if baseline_patch is None:
+        if sleep_interruptible(timeout_seconds):
+            return "ABORTED", 0.0, "OTP generation aborted by user (Esc pressed)."
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return "FOCUS_LOST", 0.0, fg_msg
+        return "CHANGED", 1.0, ""
+
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    last_ratio = 0.0
+
+    while True:
+        if check_abort():
+            return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return "FOCUS_LOST", last_ratio, fg_msg
+
+        live_patch = _capture_region_patch(center_pt["x"], center_pt["y"], half_w=half_w, half_h=half_h)
+        if live_patch is not None:
+            last_ratio = _compute_patch_diff_ratio(baseline_patch, live_patch)
+            if last_ratio >= threshold:
+                if min_settle > 0.0 and sleep_interruptible(min_settle):
+                    return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+                fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+                if not fg_ok:
+                    return "FOCUS_LOST", last_ratio, fg_msg
+                return "CHANGED", last_ratio, ""
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        if sleep_interruptible(min(float(poll_interval), remaining)):
+            return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+
+    return "TIMEOUT", last_ratio, f"Screen region at ({center_pt['x']}, {center_pt['y']}) did not change (diff={last_ratio:.3f} < {threshold:.3f})."
+
+
+def _wait_for_region_restore(
+    center_pt,
+    target_patch,
+    timeout_seconds,
+    max_diff_threshold=0.08,
+    min_settle=0.2,
+    expected_fg=None,
+    poll_interval=0.1,
+    half_w=120,
+    half_h=80,
+):
+    """
+    Polls until the screen region centered at `center_pt` returns to matching `target_patch`
+    (diff_ratio <= max_diff_threshold). Checks `check_abort()` and `verify_erp_foreground()` on each tick.
+    Returns (status: str, diff_ratio: float, error_msg: str) where status is one of:
+    'RESTORED', 'ABORTED', 'FOCUS_LOST', 'TIMEOUT'.
+    """
+    if target_patch is None:
+        if sleep_interruptible(timeout_seconds):
+            return "ABORTED", 0.0, "OTP generation aborted by user (Esc pressed)."
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return "FOCUS_LOST", 0.0, fg_msg
+        return "RESTORED", 0.0, ""
+
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    last_ratio = 1.0
+
+    while True:
+        if check_abort():
+            return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return "FOCUS_LOST", last_ratio, fg_msg
+
+        live_patch = _capture_region_patch(center_pt["x"], center_pt["y"], half_w=half_w, half_h=half_h)
+        if live_patch is not None:
+            last_ratio = _compute_patch_diff_ratio(target_patch, live_patch)
+            if last_ratio <= max_diff_threshold:
+                if min_settle > 0.0 and sleep_interruptible(min_settle):
+                    return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+                fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+                if not fg_ok:
+                    return "FOCUS_LOST", last_ratio, fg_msg
+                return "RESTORED", last_ratio, ""
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        if sleep_interruptible(min(float(poll_interval), remaining)):
+            return "ABORTED", last_ratio, "OTP generation aborted by user (Esc pressed)."
+
+    return "TIMEOUT", last_ratio, f"Screen region at ({center_pt['x']}, {center_pt['y']}) did not restore to baseline (diff={last_ratio:.3f} > {max_diff_threshold:.3f})."
 
 
 def restore_erp_focus(timings=None):
@@ -611,15 +955,21 @@ def process_complaint(
         return False, str(e)
 
 
-def generate_otp(complaint_no, config=None):
+def generate_otp(complaint_no, config=None, expected_fg=None):
     """
-    Executes the automated OTP Generation workflow inside Oracle Forms:
-    1. Click 'Add' button to open the OTP module.
-    2. Click 3-dots next to Complaint No. to open search module.
+    Executes the automated OTP Generation workflow inside Oracle Forms with
+    configurable post-paste/query delays, [ESC]-responsive chunked sleeps,
+    Edge IE Mode / Java foreground window verification, and zero-calibration
+    visual modal transition checks:
+    1. Click 'Add' button to open the OTP sub-window (verifies sub-window opened).
+    2. Click 3-dots next to Complaint No. to open Complaint LOV modal (verifies LOV opened).
     3. Double-click search input, then paste complaint number via pyperclip.
-    4. Press Enter to search/select, then Enter again to confirm/close search module.
-    5. Click 3-dots next to OTP Reason (click once to focus window, wait 1s, click 3-dots).
-    6. Press Enter 4 times with micro-delays to confirm reason and return to primary screen.
+    4. Press Enter #1 to query LOV, wait `otp_query_wait_seconds`, press Enter #2 to
+       select/close, and verify the Complaint LOV closed cleanly without an obstructive alert.
+    5. Click 3-dots next to OTP Reason (focus click, wait, activate click) and verify
+       the centered OTP Reason LOV modal opened (trapping any validation alert before Enter x4).
+    6. Press Enter 4 times with configurable delays to confirm reason and verify the OTP
+       sub-window closed back to the primary screen.
 
     Returns (success: bool, message: str).
     """
@@ -629,84 +979,280 @@ def generate_otp(complaint_no, config=None):
             config = config_manager.DEFAULT_CONFIG
 
     coords = config.get("coordinates", config_manager.DEFAULT_CONFIG["coordinates"])
-    timings = config.get("timings", config_manager.DEFAULT_CONFIG["timings"])
+    timings = config_manager.get_timings_settings(config)
+    guard_cfg = config_manager.get_otp_guard_settings(config)
+    verify_ui = guard_cfg["otp_verify_screen_transitions"]
+    diff_thresh = guard_cfg["otp_screen_diff_threshold"]
+    restore_thresh = max(0.08, diff_thresh * 2.5)
 
     num = str(complaint_no).strip()
     if not num:
         return False, "Complaint number cannot be empty."
 
-    # Early abort check
+    # Early abort & foreground check
     if check_abort():
         return False, "OTP generation aborted by user (Esc pressed)."
+    fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+    if not fg_ok:
+        logger.warning("[OTP] Foreground verification failed before starting #%s: %s", num, fg_msg)
+        return False, f"Halted before Step 1/6 for #{num}: {fg_msg}"
+
+    add_pt = coords.get("otp_add_btn", {"x": 200, "y": 200})
+    search_btn = coords.get("otp_complaint_search_btn", {"x": 350, "y": 250})
+    input_pt = coords.get("otp_search_input", {"x": 500, "y": 300})
+    reason_btn = coords.get("otp_reason_search_btn", {"x": 350, "y": 350})
 
     try:
-        # Step 1: Open OTP module by clicking "Add" button
+        # Capture baseline patch on the primary screen before clicking 'Add'
+        main_screen_search_btn_patch = (
+            _capture_region_patch(search_btn["x"], search_btn["y"]) if verify_ui else None
+        )
+
+        # Step 1: Open OTP sub-window by clicking "Add" button
         logger.info("\n[OTP] Step 1/6: Opening OTP module (Click 'Add')...")
-        add_pt = coords.get("otp_add_btn", {"x": 200, "y": 200})
         pyautogui.click(add_pt["x"], add_pt["y"])
-        time.sleep(timings.get("otp_window_open_seconds", 1.5))
 
-        if check_abort():
-            return False, "OTP generation aborted by user (Esc pressed)."
+        if verify_ui and main_screen_search_btn_patch is not None:
+            st1, ratio1, err1 = _wait_for_region_change(
+                search_btn,
+                main_screen_search_btn_patch,
+                timeout_seconds=max(timings["otp_window_open_seconds"], 2.0),
+                threshold=diff_thresh,
+                min_settle=0.3,
+                expected_fg=expected_fg,
+            )
+            logger.debug("[OTP] Step 1 transition status=%s (diff=%.3f).", st1, ratio1)
+            if st1 == "ABORTED":
+                return False, err1
+            if st1 == "FOCUS_LOST":
+                return False, f"Halted at Step 1/6 for #{num}: {err1}"
+            if st1 == "TIMEOUT":
+                return (
+                    False,
+                    f"Halted at Step 1/6 for #{num}: OTP 'Add' sub-window did not open "
+                    "(ERP lagged or screen is blocked by an existing modal/popup).",
+                )
+        else:
+            if sleep_interruptible(timings["otp_window_open_seconds"]):
+                return False, "OTP generation aborted by user (Esc pressed)."
+            fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+            if not fg_ok:
+                return False, f"Halted at Step 1/6 for #{num}: {fg_msg}"
 
-        # Step 2: Open Complaint search module by clicking 3-dots icon
+        # Step 2: Open Complaint search LOV modal by clicking 3-dots icon
         logger.info("[OTP] Step 2/6: Opening Complaint lookup (Click 3-dots)...")
-        search_btn = coords.get("otp_complaint_search_btn", {"x": 350, "y": 250})
-        pyautogui.click(search_btn["x"], search_btn["y"])
-        time.sleep(timings.get("otp_search_modal_seconds", 1.2))
+        subwindow_center_patch = (
+            _capture_region_patch(input_pt["x"], input_pt["y"]) if verify_ui else None
+        )
+        subwindow_reason_patch = (
+            _capture_region_patch(reason_btn["x"], reason_btn["y"]) if verify_ui else None
+        )
 
-        if check_abort():
-            return False, "OTP generation aborted by user (Esc pressed)."
+        pyautogui.click(search_btn["x"], search_btn["y"])
+
+        if verify_ui and subwindow_center_patch is not None:
+            st2, ratio2, err2 = _wait_for_region_change(
+                input_pt,
+                subwindow_center_patch,
+                timeout_seconds=max(timings["otp_search_modal_seconds"], 2.0),
+                threshold=diff_thresh,
+                min_settle=0.25,
+                expected_fg=expected_fg,
+            )
+            logger.debug("[OTP] Step 2 transition status=%s (diff=%.3f).", st2, ratio2)
+            if st2 == "ABORTED":
+                return False, err2
+            if st2 == "FOCUS_LOST":
+                return False, f"Halted at Step 2/6 for #{num}: {err2}"
+            if st2 == "TIMEOUT":
+                return (
+                    False,
+                    f"Halted at Step 2/6 for #{num}: Complaint Search LOV modal did not open.",
+                )
+        else:
+            if sleep_interruptible(timings["otp_search_modal_seconds"]):
+                return False, "OTP generation aborted by user (Esc pressed)."
+            fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+            if not fg_ok:
+                return False, f"Halted at Step 2/6 for #{num}: {fg_msg}"
 
         # Step 3: Double-click search input to highlight text and paste complaint number
         logger.info(f"[OTP] Step 3/6: Highlighting and pasting Complaint #{num}...")
-        input_pt = coords.get("otp_search_input", {"x": 500, "y": 300})
         pyautogui.doubleClick(input_pt["x"], input_pt["y"])
-        time.sleep(0.2)
+        if sleep_interruptible(timings["otp_input_focus_delay_seconds"]):
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return False, f"Halted at Step 3/6 for #{num}: {fg_msg}"
+
         pyperclip.copy(num)
         pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.3)
-
-        if check_abort():
+        if sleep_interruptible(timings["otp_post_paste_delay_seconds"]):
             return False, "OTP generation aborted by user (Esc pressed)."
 
-        # Step 4: Press Enter to search/select, then Enter again to confirm/close
-        logger.info("[OTP] Step 4/6: Selecting complaint and closing lookup (Enter x2)...")
-        enter_delay = timings.get("otp_enter_delay_seconds", 0.3)
-        pyautogui.press('enter')
-        time.sleep(enter_delay)
-        pyautogui.press('enter')
-        time.sleep(timings.get("otp_window_open_seconds", 1.5))
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return False, f"Halted at Step 3/6 for #{num}: {fg_msg}"
 
-        if check_abort():
+        # Step 4: Press Enter #1 to query LOV, wait otp_query_wait_seconds, then Enter #2 to select/close
+        query_wait = timings["otp_query_wait_seconds"]
+        modal_close_timeout = timings["otp_modal_close_timeout_seconds"]
+        logger.info(
+            f"[OTP] Step 4/6: Querying Complaint #{num} (Enter #1 -> wait {query_wait:.1f}s -> Enter #2)..."
+        )
+        pyautogui.press('enter')
+        if sleep_interruptible(query_wait):
             return False, "OTP generation aborted by user (Esc pressed)."
+
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return False, f"Halted at Step 4/6 for #{num}: {fg_msg}"
+
+        # Snapshot open LOV right before Enter #2 so we can verify Enter #2 closes the LOV modal
+        pre_enter2_lov_patch = (
+            _capture_region_patch(input_pt["x"], input_pt["y"]) if verify_ui else None
+        )
+
+        pyautogui.press('enter')
+
+        if verify_ui and pre_enter2_lov_patch is not None:
+            # Gate 4A: Confirm the Complaint LOV modal closed after Enter #2
+            st4a, ratio4a, err4a = _wait_for_region_change(
+                input_pt,
+                pre_enter2_lov_patch,
+                timeout_seconds=modal_close_timeout,
+                threshold=diff_thresh,
+                min_settle=0.2,
+                expected_fg=expected_fg,
+            )
+            logger.debug("[OTP] Step 4A LOV-close status=%s (diff=%.3f).", st4a, ratio4a)
+            if st4a == "ABORTED":
+                return False, err4a
+            if st4a == "FOCUS_LOST":
+                return False, f"Halted at Step 4/6 for #{num}: {err4a}"
+            if st4a == "TIMEOUT":
+                return (
+                    False,
+                    f"Halted at Step 4/6 for #{num}: Complaint Search LOV stayed open after query "
+                    "(no matching record found, invalid status, or ERP query lagged past timeout).",
+                )
+
+            # Gate 4B: Confirm the underlying OTP sub-window around Reason 3-dots is visible & unobstructed
+            if subwindow_reason_patch is not None:
+                st4b, ratio4b, err4b = _wait_for_region_restore(
+                    reason_btn,
+                    subwindow_reason_patch,
+                    timeout_seconds=1.2,
+                    max_diff_threshold=restore_thresh,
+                    min_settle=0.1,
+                    expected_fg=expected_fg,
+                )
+                logger.debug("[OTP] Step 4B sub-window restore status=%s (diff=%.3f).", st4b, ratio4b)
+                if st4b == "ABORTED":
+                    return False, err4b
+                if st4b == "FOCUS_LOST":
+                    return False, f"Halted at Step 4/6 for #{num}: {err4b}"
+                if st4b == "TIMEOUT":
+                    return (
+                        False,
+                        f"Halted at Step 4/6 for #{num}: Unexpected Oracle popup or modal obscuring OTP sub-window.",
+                    )
+
+        if sleep_interruptible(timings["otp_post_select_delay_seconds"]):
+            return False, "OTP generation aborted by user (Esc pressed)."
+
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return False, f"Halted at Step 4/6 for #{num}: {fg_msg}"
 
         # Step 5: Click 3-dots next to OTP Reason (focus click, delay, then activate click)
         logger.info("[OTP] Step 5/6: Focusing and opening OTP Reason lookup (Double-tap)...")
-        reason_btn = coords.get("otp_reason_search_btn", {"x": 350, "y": 350})
+        pre_reason_center_patch = (
+            _capture_region_patch(input_pt["x"], input_pt["y"]) if verify_ui else None
+        )
+
         # Focus click
         pyautogui.click(reason_btn["x"], reason_btn["y"])
-        time.sleep(timings.get("otp_reason_focus_seconds", 1.0))
-
-        if check_abort():
+        if sleep_interruptible(timings["otp_reason_focus_seconds"]):
             return False, "OTP generation aborted by user (Esc pressed)."
+
+        fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+        if not fg_ok:
+            return False, f"Halted at Step 5/6 for #{num}: {fg_msg}"
 
         # Activate click
         pyautogui.click(reason_btn["x"], reason_btn["y"])
-        time.sleep(timings.get("otp_search_modal_seconds", 1.2))
 
-        if check_abort():
-            return False, "OTP generation aborted by user (Esc pressed)."
+        if verify_ui and pre_reason_center_patch is not None:
+            # Gate 5: Confirm centered OTP Reason LOV opened (traps any Oracle validation alert before Enter x4)
+            st5, ratio5, err5 = _wait_for_region_change(
+                input_pt,
+                pre_reason_center_patch,
+                timeout_seconds=max(timings["otp_search_modal_seconds"], 2.0),
+                threshold=diff_thresh,
+                min_settle=0.25,
+                expected_fg=expected_fg,
+            )
+            logger.debug("[OTP] Step 5 Reason-LOV status=%s (diff=%.3f).", st5, ratio5)
+            if st5 == "ABORTED":
+                return False, err5
+            if st5 == "FOCUS_LOST":
+                return False, f"Halted at Step 5/6 for #{num}: {err5}"
+            if st5 == "TIMEOUT":
+                return (
+                    False,
+                    f"Halted at Step 5/6 for #{num}: OTP Reason LOV modal did not open "
+                    "(blocked by an active Oracle Alert or unselected complaint).",
+                )
+        else:
+            if sleep_interruptible(timings["otp_search_modal_seconds"]):
+                return False, "OTP generation aborted by user (Esc pressed)."
+            fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+            if not fg_ok:
+                return False, f"Halted at Step 5/6 for #{num}: {fg_msg}"
 
-        # Step 6: Press Enter 4 times with micro-delays to confirm reason and return
+        # Step 6: Press Enter 4 times with micro-delays to confirm reason and return to primary screen
         logger.info("[OTP] Step 6/6: Confirming OTP reason and committing (Enter x4)...")
+        enter_delay = timings["otp_enter_delay_seconds"]
         for i in range(1, 5):
             if check_abort():
                 return False, "OTP generation aborted by user (Esc pressed)."
+            fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+            if not fg_ok:
+                return False, f"Halted at Step 6/6 (Enter {i}/4) for #{num}: {fg_msg}"
             pyautogui.press('enter')
-            time.sleep(enter_delay)
+            if sleep_interruptible(enter_delay):
+                return False, "OTP generation aborted by user (Esc pressed)."
 
-        time.sleep(timings.get("otp_window_open_seconds", 1.5))
+        if verify_ui and main_screen_search_btn_patch is not None:
+            # Gate 6: Confirm OTP sub-window closed cleanly back to the primary screen
+            st6, ratio6, err6 = _wait_for_region_restore(
+                search_btn,
+                main_screen_search_btn_patch,
+                timeout_seconds=modal_close_timeout,
+                max_diff_threshold=restore_thresh,
+                min_settle=0.2,
+                expected_fg=expected_fg,
+            )
+            logger.debug("[OTP] Step 6 main-screen restore status=%s (diff=%.3f).", st6, ratio6)
+            if st6 == "ABORTED":
+                return False, err6
+            if st6 == "FOCUS_LOST":
+                return False, f"Halted at Step 6/6 for #{num}: {err6}"
+            if st6 == "TIMEOUT":
+                return (
+                    False,
+                    f"Halted at Step 6/6 for #{num}: OTP sub-window did not close cleanly after Enter x4 "
+                    "(possible Oracle validation alert).",
+                )
+        else:
+            if sleep_interruptible(timings["otp_window_open_seconds"]):
+                return False, "OTP generation aborted by user (Esc pressed)."
+            fg_ok, fg_msg = verify_erp_foreground(expected_fg)
+            if not fg_ok:
+                return False, f"Halted at Step 6/6 for #{num}: {fg_msg}"
+
         logger.info(f"[+] OTP successfully generated for Complaint #{num}!")
         return True, f"OTP generated successfully for complaint #{num}"
 
