@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
-## Project: Oracle ERP Bulk PDF Printer & Sorter (v6.3.0: Direct Browser Print, Batch Remarks PDF Stamping & Self-Updater)
-**Document Version:** 2.2.0  
-**Status:** Completed (v6.3.0 — Phase 6–9: SQLite WAL State, In-App Self-Updater, Batch Remarks PDF Stamping & Direct Browser Print)  
+## Project: Oracle ERP Bulk PDF Printer & Sorter (v6.3.1: Hardened OTP Generation, Direct Browser Print, Batch Remarks PDF Stamping & Self-Updater)
+**Document Version:** 2.2.1  
+**Status:** Completed (v6.3.1 — Phase 6–10: SQLite WAL State, In-App Self-Updater, Batch Remarks PDF Stamping, Direct Browser Print & Hardened OTP Generation)  
 **Author:** Pair Programming Session (Antigravity & Lead Engineer)
 
 ---
@@ -236,3 +236,4 @@ flowchart TD
 | **Phase 7** | **In-App Self-Updater (`updater.py`, `version.py`)** | **COMPLETED** | GitHub Releases API polling, SHA-256 verification, detached `.bat` swap with rollback protection, `[U]` CLI menu, and `build.py` release ZIP automation. |
 | **Phase 8** | **Batch Technician Remarks PDF Stamping (`pdf_remarks.py`)** | **COMPLETED** | PyMuPDF remarks stamping (`[7]`), dynamic border anchoring, font auto-scaling/truncation, mirrored `Stamped_Complaints/` output, `[5]` source switching, and CSV issue reporting. |
 | **Phase 9** | **Direct Browser Print (`engine.py`, `printer_manager.py`)** | **COMPLETED** | Workflow selector (`[1]` Save PDF vs `[2]` Direct Print) in Bulk `[1]` & Manual `[2]`, `temporary_default_printer` `try/finally` guard, sliding-window `win32print` spool verification, and direct-print reset handling. |
+| **Phase 10** | **Hardened OTP Generation (`engine.py`, `main.py`, `config_manager.py`)** | **COMPLETED** | 6-stage visual modal transition state machine, tunable `otp_query_wait_seconds` (`2.5s`) & modal timeouts (`get_timings_settings`), Edge IE/Java foreground PID guard, `[ESC]`-chunked sleeps, input sanitization, and copy-pasteable remainder halt summary. |

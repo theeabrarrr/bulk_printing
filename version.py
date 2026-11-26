@@ -1,6 +1,6 @@
 import re
 
-__version__ = "6.3.0"
+__version__ = "6.3.1"
 APP_NAME = "ERP_Automation_Suite"
 EXE_NAME = "ERP_Automation_Suite"
 GITHUB_REPO = "theeabrarrr/bulk_printing"

@@ -1,8 +1,13 @@
-# Oracle ERP Automation Suite (v6.3.0: Direct Browser Printing, Remarks PDF Stamping, In-App Self-Updater & Enterprise SQLite State)
+# Oracle ERP Automation Suite (v6.3.1: Hardened OTP Generation, Direct Browser Printing, Remarks PDF Stamping, In-App Self-Updater & Enterprise SQLite State)
 
-An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader (or sends print jobs straight to a physical printer with **Direct Browser Print**), automatically sorts saved PDFs into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), stamps technician remarks onto matching PDFs (`Stamped_Complaints/`), performs **Universal Silent Physical Printing**, automates single-complaint **OTP Generation**, and includes an **In-App Self-Updater** via GitHub Releases.
+An automated RPA (Robotic Process Automation) application that extracts complaint job cards from an Oracle Forms ERP system, generates PDFs via Internet Explorer / Foxit Reader (or sends print jobs straight to a physical printer with **Direct Browser Print**), automatically sorts saved PDFs into technician folders (`Today_Complaints/<Technician_Name>/<Complaint_No>.pdf`), stamps technician remarks onto matching PDFs (`Stamped_Complaints/`), performs **Universal Silent Physical Printing**, automates single/batch **OTP Generation** with visual modal transition guards, and includes an **In-App Self-Updater** via GitHub Releases.
 
-## Key Enterprise Features (v6.3.0)
+## Key Enterprise Features (v6.3.1)
+- **Hardened Interactive OTP Generation Mode (`[4]`, `engine.py`, `main.py`, `config_manager.py`, `config.json`)**:
+  - **6-Stage Visual Modal Transition State Machine**: Uses zero-calibration screen-bounds-clamped grayscale patch diffing (`Pillow` `ImageGrab` + `ImageChops`) to verify that the OTP `Add` sub-window opens, the Complaint Search LOV modal opens and closes cleanly after querying, the centered OTP Reason LOV opens (trapping any active Oracle Alert popup before `Enter x4` commits), and the sub-window closes back to the primary screen.
+  - **Tunable `config.json` Query & Modal Timings**: Splits `otp_query_wait_seconds` (default `2.5` s) from `otp_enter_delay_seconds` (`0.4` s) and exposes all OTP delays (`otp_start_countdown_seconds`, `otp_input_focus_delay_seconds`, `otp_post_paste_delay_seconds`, `otp_modal_close_timeout_seconds`, `otp_post_select_delay_seconds`, `otp_between_complaints_seconds`) and screen-transition guards (`otp_verify_screen_transitions`, `otp_screen_diff_threshold`) in `config.json` with type-safe validation (`get_timings_settings()`, `get_otp_guard_settings()`).
+  - **Edge IE Mode / Java Applet Foreground Guard & `[ESC]`-Chunked Sleeps**: Verifies active window focus across parent `msedge.exe`/`iexplore.exe` and child Java (`jp2launcher.exe`/`java.exe`/`javaw.exe`) LOV dialogs while immediately halting if focus shifts to the CLI console or unrelated apps, with `50ms` chunked `sleep_interruptible()` for instant `[ESC]` response.
+  - **Input Sanitization & Copy-Pasteable Remainder Summary**: Strips `.0` float suffixes, filters pasted Excel headers (`COMPLAINT_NO`, `#REF!`), deduplicates IDs preserving order, and halts the batch immediately with an audible alert chime and a copy-pasteable list of remaining complaint IDs if any complaint stalls.
 - **Direct Browser Print (No PDF Save) & OS Default Printer Guard (`engine.py`, `printer_manager.py`, `main.py`)**:
   - In **Bulk Mode (`[1]`)** and **Manual Mode (`[2]`)**, operators choose between **`[1] Save PDF to Disk`** (existing `Today_Complaints/` workflow) and **`[2] Direct Browser Print (No PDF Save - Straight to Printer)`**.
   - **Automatic Windows OS Default Printer Guard (`temporary_default_printer`)**: Temporarily sets the Windows OS default printer (`win32print.SetDefaultPrinter`) to the validated physical printer during Direct Browser Print (or `Microsoft Print to PDF` during Save PDF mode) and strictly restores the original OS default printer inside a `try/finally` block on completion, error, or abort (`[ESC]` / `Ctrl+C`).
@@ -96,14 +101,14 @@ python -B build.py
 # Or build and automatically publish the GitHub Release via GitHub CLI:
 python -B build.py --publish
 ```
-This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` (bundling `pypdfium2` and `pymupdf`) while preserving existing `config.json`, `complaints.xlsx`, `complaint_remarks.xlsx`, `complaints_state.db`, `logs/`, `Today_Complaints/`, and `Stamped_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.3.0.zip` + `.sha256` checksum.
+This compiles `main.py` via PyInstaller with `--onedir` into `dist/ERP_Automation_Suite/` (bundling `pypdfium2` and `pymupdf`) while preserving existing `config.json`, `complaints.xlsx`, `complaint_remarks.xlsx`, `complaints_state.db`, `logs/`, `Today_Complaints/`, and `Stamped_Complaints/`, and packages the clean binary release archive `dist/ERP_Automation_Suite_v6.3.1.zip` + `.sha256` checksum.
 
 ### Architecture Overview
 | File | Responsibility |
 | :--- | :--- |
-| `main.py` | Entry point, CLI menu router (`[1]`–`[8]`, `[U]`), print workflow mode selector (`Save PDF` vs `Direct Browser Print`), strict Excel validation & Pre-Flight Summary, Batch Remarks Stamping `[7]`, and Batch Print mode `[5]` (`Today_Complaints` / `Stamped_Complaints`). |
+| `main.py` | Entry point, CLI menu router (`[1]`–`[8]`, `[U]`), print workflow mode selector (`Save PDF` vs `Direct Browser Print`), strict Excel validation & Pre-Flight Summary, Interactive OTP Mode `[4]` with input sanitization & remainder halt summary, Batch Remarks Stamping `[7]`, and Batch Print mode `[5]` (`Today_Complaints` / `Stamped_Complaints`). |
 | `pdf_remarks.py` | PyMuPDF batch remarks stamping engine: Excel validation, dynamic border anchoring, font auto-scaling (`9.5`–`6.0 pt`) with word-boundary truncation, atomic saves, and CSV issue reporting. |
-| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.3.0"`), SemVer comparisons, and release asset naming. |
+| `version.py` | Single source of truth for semantic versioning (`__version__ = "6.3.1"`), SemVer comparisons, and release asset naming. |
 | `updater.py` | In-App Self-Updater: GitHub Releases API polling, SHA-256 verification, staging, and detached `.bat` swap & rollback helper (preserving `Stamped_Complaints/` and `complaint_remarks.xlsx`). |
 | `state_manager.py` | SQLite WAL database engine (`complaints_state.db`), progressive job state transitions, safe backups, direct-print vs saved-PDF reset logic, and legacy `.txt` auto-migrator. |
 | `logger_manager.py` | Centralized logging manager with `RotatingFileHandler` (`logs/app.log`, 5 MB x 5 backups), console stream formatting, and crash hook. |
