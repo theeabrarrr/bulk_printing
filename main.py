@@ -587,11 +587,62 @@ def run_manual_mode(config):
     print(" (Note: Bulk progress tracking was not updated to prevent skipping in bulk batches.)\n")
 
 
+def sanitize_otp_complaint_inputs(raw_input):
+    """
+    Sanitizes and validates a raw string of comma/whitespace-separated complaint numbers
+    for Interactive OTP Mode [4]:
+      1. Splits on whitespace and commas.
+      2. Strips float '.0' suffixes (e.g., '282634716.0' -> '282634716').
+      3. Rejects non-numeric tokens (e.g., pasted Excel headers like 'COMPLAINT_NO' or '#REF!').
+      4. Deduplicates repeated IDs while preserving first-seen order.
+    Returns (valid_complaints: List[str], invalid_tokens: List[str], duplicate_tokens: List[str]).
+    """
+    valid_complaints = []
+    invalid_tokens = []
+    duplicate_tokens = []
+    seen = set()
+
+    if not raw_input or not str(raw_input).strip():
+        return valid_complaints, invalid_tokens, duplicate_tokens
+
+    raw_tokens = [tok.strip() for tok in re.split(r"[\s,]+", str(raw_input).strip()) if tok.strip()]
+    for tok in raw_tokens:
+        cleaned = tok
+        if re.fullmatch(r"\d+\.0+", cleaned):
+            cleaned = cleaned.split(".", 1)[0]
+
+        if not cleaned.isdigit():
+            invalid_tokens.append(tok)
+            continue
+
+        if cleaned in seen:
+            duplicate_tokens.append(cleaned)
+            continue
+
+        seen.add(cleaned)
+        valid_complaints.append(cleaned)
+
+    return valid_complaints, invalid_tokens, duplicate_tokens
+
+
+def _play_otp_alert_chime():
+    """Plays a dual low-frequency alert tone when OTP generation halts on a stuck ERP screen."""
+    try:
+        calibration_wizard.play_chime(freq=450, duration_ms=300)
+        time.sleep(0.08)
+        calibration_wizard.play_chime(freq=450, duration_ms=350)
+    except Exception:
+        pass
+
+
 def run_otp_mode(config):
     """
     Interactive continuous loop for OTP Generation.
     Prompts user for complaint numbers (single or comma/space-separated),
-    displays countdown once, and sequentially invokes engine.generate_otp().
+    sanitizes/validates numeric IDs, displays a configurable countdown, verifies
+    ERP foreground focus, and sequentially invokes engine.generate_otp().
+    Halts immediately on any stuck screen/popup/abort and prints a copy-pasteable
+    list of remaining complaint numbers.
     Continues looping until user enters empty string or 'q'.
     """
     engine.reset_abort()
@@ -613,39 +664,109 @@ def run_otp_mode(config):
                 print("Returning to main menu...")
                 break
 
-            complaint_list = [c.strip() for c in re.split(r'[\s,]+', raw_input) if c.strip()]
+            complaint_list, invalid_tokens, duplicate_tokens = sanitize_otp_complaint_inputs(raw_input)
+            if invalid_tokens:
+                logger.warning(
+                    f"  [!] Skipped {len(invalid_tokens)} non-numeric token(s): {', '.join(invalid_tokens)}"
+                )
+            if duplicate_tokens:
+                logger.info(
+                    f"  [!] Notice: Removed {len(duplicate_tokens)} duplicate complaint ID(s) "
+                    f"({len(complaint_list)} unique record(s) queued)."
+                )
             if not complaint_list:
+                logger.warning("  [!] No valid numeric complaint numbers provided. Please try again.")
                 continue
 
-            logger.info(f"\n[*] Starting OTP Generation for {len(complaint_list)} complaint(s) in 3 seconds! Switch to Oracle Forms window...")
+            timings = config_manager.get_timings_settings(config)
+            countdown_sec = timings.get("otp_start_countdown_seconds", 3.0)
+            between_sec = timings.get("otp_between_complaints_seconds", 1.5)
+            countdown_steps = max(0, int(round(countdown_sec)))
+
+            logger.info(
+                f"\n[*] Starting OTP Generation for {len(complaint_list)} complaint(s) "
+                f"in {countdown_steps} seconds! Switch to Oracle Forms window..."
+            )
             countdown_aborted = False
-            for i in range(3, 0, -1):
+            for i in range(countdown_steps, 0, -1):
                 if engine.check_abort():
                     logger.warning("\n[!] Aborted during countdown.")
                     countdown_aborted = True
                     break
                 print(f"  Countdown: {i}...")
-                time.sleep(1.0)
+                if engine.sleep_interruptible(1.0):
+                    logger.warning("\n[!] Aborted during countdown.")
+                    countdown_aborted = True
+                    break
 
             if countdown_aborted:
                 continue
 
+            expected_fg = engine.capture_foreground_window_context()
+            if expected_fg is not None and expected_fg.get("is_console"):
+                _play_otp_alert_chime()
+                active_title = expected_fg.get("title") or expected_fg.get("process_name") or "CLI Console"
+                logger.warning(
+                    f"\n[!] Halted before OTP execution: Active foreground window is still the CLI console "
+                    f"('{active_title}'). Please switch focus to the Oracle Forms window during the countdown."
+                )
+                print("\n" + "=" * 55)
+                print("        OTP BATCH EXECUTION SUMMARY (HALTED)")
+                print("=" * 55)
+                print(f" Total Queued      : {len(complaint_list)}")
+                print(f" Completed         : 0")
+                print(f" Remaining         : {len(complaint_list)}")
+                print(f" Remaining IDs (copy & re-paste after focusing ERP):")
+                print(f"   {' '.join(complaint_list)}")
+                print("=" * 55)
+                continue
+
+            completed_ids = []
+            remaining_ids = []
+            halted_reason = None
+
             for idx, num in enumerate(complaint_list, 1):
                 if engine.check_abort():
                     logger.warning("\n[!] OTP Generation stopped by user (Esc pressed).")
+                    halted_reason = "OTP generation aborted by user (Esc pressed)."
+                    remaining_ids = complaint_list[idx - 1 :]
                     break
 
                 logger.info(f"\n[->] [{idx}/{len(complaint_list)}] Generating OTP for Complaint #{num}...")
-                success, msg = engine.generate_otp(num, config)
-                if success:
-                    logger.info(f"[+] Success: {msg}")
-                else:
-                    logger.warning(f"[!] Notice: {msg}")
-                    if "aborted" in msg.lower() or "failsafe" in msg.lower():
-                        logger.warning("    Execution stopped due to abort signal.")
-                        break
+                try:
+                    success, msg = engine.generate_otp(num, config, expected_fg=expected_fg)
+                except TypeError:
+                    success, msg = engine.generate_otp(num, config)
 
-                time.sleep(1.0)
+                if success:
+                    completed_ids.append(num)
+                    logger.info(f"[+] Success: {msg}")
+                    if idx < len(complaint_list) and between_sec > 0.0:
+                        if engine.sleep_interruptible(between_sec):
+                            logger.warning("\n[!] OTP Generation stopped by user (Esc pressed).")
+                            halted_reason = "OTP generation aborted by user (Esc pressed)."
+                            remaining_ids = complaint_list[idx:]
+                            break
+                else:
+                    _play_otp_alert_chime()
+                    logger.warning(f"[!] Halted on Complaint #{num}: {msg}")
+                    halted_reason = msg
+                    remaining_ids = complaint_list[idx - 1 :]
+                    break
+
+            status_label = "HALTED" if halted_reason else "COMPLETED"
+            print("\n" + "=" * 55)
+            print(f"        OTP BATCH EXECUTION SUMMARY ({status_label})")
+            print("=" * 55)
+            print(f" Total Queued      : {len(complaint_list)}")
+            print(f" Completed         : {len(completed_ids)}")
+            print(f" Remaining         : {len(remaining_ids)}")
+            if halted_reason:
+                print(f" Halt Reason       : {halted_reason}")
+            if remaining_ids:
+                print(" Remaining IDs (copy & re-paste after fixing ERP):")
+                print(f"   {' '.join(remaining_ids)}")
+            print("=" * 55)
     except KeyboardInterrupt:
         logger.warning("\n[!] OTP mode interrupted by user (Ctrl+C). Returning to main menu...")
 
